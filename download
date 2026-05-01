@@ -1,745 +1,813 @@
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useRef, useCallback } from "react";
 
-function loadSheetJS(cb) {
-  if (window.XLSX) { cb(); return; }
+/* ─── SheetJS CDN ─── */
+function loadXLSX(cb) {
+  if (window.XLSX) return cb();
   const s = document.createElement("script");
   s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-  s.onload = cb; document.head.appendChild(s);
+  s.onload = cb;
+  document.head.appendChild(s);
 }
 
 const C = {
-  red:"#C8102E",redLight:"#F5E6E9",white:"#FFFFFF",
-  gray50:"#FAFAFA",gray100:"#F4F4F5",gray200:"#E4E4E7",
-  gray300:"#D4D4D8",gray400:"#A1A1AA",gray500:"#71717A",
-  gray600:"#52525B",gray800:"#27272A",gray900:"#18181B",
-  green:"#15803D",greenLight:"#DCFCE7",
-  yellow:"#B45309",yellowLight:"#FEF9C3",
-  orange:"#C2410C",orangeLight:"#FFEDD5",
-  redAlert:"#B91C1C",redAlertLight:"#FEE2E2",
-  blue:"#1D4ED8",blueLight:"#DBEAFE",
+  red:"#C8102E", redLight:"#F5E6E9", white:"#FFFFFF",
+  gray50:"#FAFAFA", gray100:"#F4F4F5", gray200:"#E4E4E7",
+  gray400:"#A1A1AA", gray500:"#71717A", gray600:"#52525B",
+  gray800:"#27272A", gray900:"#18181B",
+  green:"#15803D", greenLight:"#DCFCE7",
+  yellow:"#B45309", yellowLight:"#FEF9C3",
+  redAlert:"#B91C1C", redAlertLight:"#FEE2E2",
+  blue:"#1D4ED8", blueLight:"#DBEAFE",
 };
 
-/* ══════════════════════════════════════════════════════════════════
+/* ══════════════════════════════════════════════════════════════
    DADOS REAIS — Extraídos e validados das 3 planilhas SAP
-   Fonte primária: MB5B (EXPORT_113853) — autoridade em saldos e totais
-   Fonte secundária: MB51 (EXPORT_114626) — detalhe de movimentos
-   Período: 01/01/2026 → 01/05/2026 = 120 dias
    
-   FÓRMULA DE CONSUMO MÉDIO (conforme especificado):
-   Consumo/dia = Total Saídas SAP (tipos 201+261) ÷ Dias do período
-   Alternativa com inventário físico:
-   Consumo = (Est. Inicial + Entradas) - Est. Final  →  dividido por dias
-   ════════════════════════════════════════════════════════════════ */
+   FONTE PRIMÁRIA: MB5B (EXPORT_113853) — saldos e totais do período
+   FONTE SECUNDÁRIA: MB51 (EXPORT_114626) — detalhe de movimentos
+   PERÍODO: 01/01/2026 → 01/05/2026 = 120 dias
+   
+   FÓRMULA DE CONSUMO:
+   Consumo/dia = TotalSaídas(MB5B) ÷ 120 dias
+   
+   Equivalente a: (EstInicial + Entradas − EstFinal) ÷ Dias
+   
+   Consumo mensal: usa dados reais MB51 quando disponível,
+   ou estimativa proporcional (Consumo/dia × dias_do_mês) para
+   produtos sem detalhe (60493888, 62790049, 62790539)
+══════════════════════════════════════════════════════════════ */
 
-const PERIODO_DIAS = 120; // 01/01/2026 → 01/05/2026
+const PERIODO_DIAS = 120;
+
+/* Consumo mensal real MB51 — tipos 201+261 (saída consumo) */
+const MB51_MENSAL = {
+  "60111242": {"2026-03":5125,    "2026-04":3750},
+  "60502298": {"2026-01":400,     "2026-02":1250},
+  "62107397": {"2026-01":325},
+  "62775833": {"2026-01":3000,    "2026-02":4000,     "2026-03":3000,    "2026-04":1500},
+  "62789580": {"2026-01":1530,    "2026-02":4000,     "2026-03":18369.18,"2026-04":22000},
+  "62789876": {"2026-03":1440,    "2026-04":1980},
+  "62794703": {"2026-01":1000,    "2026-03":3000,     "2026-04":2000},
+  "62794704": {"2026-01":1000,    "2026-03":1000},
+  "62794705": {"2026-01":1000,    "2026-03":1100},
+  "62794706": {"2026-01":1000,    "2026-03":2200,     "2026-04":900},
+  "62794831": {"2026-03":3598},
+};
+
+/* Dias por mês no período */
+const DIAS_MES = {"2026-01":31,"2026-02":28,"2026-03":31,"2026-04":30,"2026-05":1};
+const MESES = ["2026-01","2026-02","2026-03","2026-04","2026-05"];
+
+/* Função para calcular consumo mensal estimado quando MB51 não tem detalhes */
+function calcMensal(codeSAP, consDia) {
+  const mb51 = MB51_MENSAL[codeSAP];
+  if (mb51) return mb51;
+  // Estimativa proporcional por dias do mês
+  const est = {};
+  MESES.forEach(m => { est[m] = parseFloat((consDia * DIAS_MES[m]).toFixed(2)); });
+  return est;
+}
 
 const initialProducts = [
-  // id, name, codeSAP, unit, type, supplier, leadTime, criticality
-  // Dados SAP: estIni, totalEntradas, totalSaidas, estFin (MB5B)
+  // Todos os 14 produtos do MB5B com consumo calculado de forma correta
   // consDia = totalSaidas / 120 dias
-  {
-    id:1,  name:"SULFATO DE ALUMÍNIO",               codeSAP:"60111242", unit:"KG", type:"sólido",
-    supplier:"QUIMICA CREDIE LTDA",  leadTime:15, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=81.375 | Saí=78.250 | Fin=3.125
-    estIni:0, totalEntradas:81375, totalSaidas:78250, estFin:3125,
-  },
-  {
-    id:2,  name:"CLORETO DE SÓDIO",                  codeSAP:"60493888", unit:"KG", type:"sólido",
-    supplier:"",                     leadTime:10, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=378.815 | Saí=365.815 | Fin=13.000
-    estIni:0, totalEntradas:378815, totalSaidas:365815, estFin:13000,
-  },
-  {
-    id:3,  name:"ÁCIDO CÍTRICO",                     codeSAP:"60502298", unit:"KG", type:"sólido",
-    supplier:"A M QUIMICA INDUST",   leadTime:10, criticality:"Média",
-    // MB5B: Ini=0 | Ent=21.200 | Saí=18.850 | Fin=2.350
-    estIni:0, totalEntradas:21200, totalSaidas:18850, estFin:2350,
-  },
-  {
-    id:4,  name:"FLOCULANTE SC 25KG",                codeSAP:"62107397", unit:"KG", type:"sólido",
-    supplier:"",                     leadTime:20, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=19.725 | Saí=19.725 | Fin=0
-    estIni:0, totalEntradas:19725, totalSaidas:19725, estFin:0,
-  },
-  {
-    id:5,  name:"FLOCULANTE CNT 1000L",              codeSAP:"62775833", unit:"KG", type:"líquido",
-    supplier:"QQS COMERCIO DE PROD", leadTime:20, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=360.500 | Saí=360.500 | Fin=0
-    estIni:0, totalEntradas:360500, totalSaidas:360500, estFin:0,
-  },
-  {
-    id:6,  name:"HIDRÓXIDO DE SÓDIO 50%",            codeSAP:"62789580", unit:"KG", type:"líquido",
-    supplier:"A M QUIMICA INDUST",   leadTime:15, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=539.959 | Saí=529.459 | Fin=10.500
-    estIni:0, totalEntradas:539959, totalSaidas:529459, estFin:10500,
-  },
-  {
-    id:7,  name:"HIPOCLORITO DE SÓDIO",              codeSAP:"62789876", unit:"KG", type:"líquido",
-    supplier:"A M QUIMICA INDUST",   leadTime:7,  criticality:"Alta",
-    // MB5B: Ini=0 | Ent=24.120 | Saí=18.540 | Fin=5.580
-    estIni:0, totalEntradas:24120, totalSaidas:18540, estFin:5580,
-  },
-  {
-    id:8,  name:"HIPOCLORITO DE CÁLCIO 65%",         codeSAP:"62790049", unit:"KG", type:"sólido",
-    supplier:"",                     leadTime:10, criticality:"Média",
-    // MB5B: Ini=0 | Ent=2.435 | Saí=1.950 | Fin=485
-    estIni:0, totalEntradas:2435, totalSaidas:1950, estFin:485,
-  },
-  {
-    id:9,  name:"ÁCIDO CLORÍDRICO 30%",              codeSAP:"62790539", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:12, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=14.940 | Saí=12.790 | Fin=2.150
-    estIni:0, totalEntradas:14940, totalSaidas:12790, estFin:2150,
-  },
-  {
-    id:10, name:"INIBIDOR DE CORROSÃO FOSFATO",      codeSAP:"62794703", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:25, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=18.000 | Saí=15.000 | Fin=3.000
-    estIni:0, totalEntradas:18000, totalSaidas:15000, estFin:3000,
-  },
-  {
-    id:11, name:"DISPERSANTE DE INCRUSTAÇÃO",        codeSAP:"62794704", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:25, criticality:"Média",
-    // MB5B: Ini=0 | Ent=16.200 | Saí=10.100 | Fin=6.100
-    estIni:0, totalEntradas:16200, totalSaidas:10100, estFin:6100,
-  },
-  {
-    id:12, name:"INIBIDOR CORROSÃO METAIS AMARELOS", codeSAP:"62794705", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:25, criticality:"Média",
-    // MB5B: Ini=0 | Ent=12.600 | Saí=8.400 | Fin=4.200
-    estIni:0, totalEntradas:12600, totalSaidas:8400, estFin:4200,
-  },
-  {
-    id:13, name:"INIBIDOR DE CORROSÃO ZINCO",        codeSAP:"62794706", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:25, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=16.200 | Saí=12.200 | Fin=4.000
-    estIni:0, totalEntradas:16200, totalSaidas:12200, estFin:4000,
-  },
-  {
-    id:14, name:"POLÍMERO CATIÔNICO IBC 1000L",      codeSAP:"62794831", unit:"KG", type:"líquido",
-    supplier:"",                     leadTime:30, criticality:"Alta",
-    // MB5B: Ini=0 | Ent=7.200 | Saí=7.198 | Fin=2
-    estIni:0, totalEntradas:7200, totalSaidas:7198, estFin:2,
-  },
+  {id:1,  codeSAP:"60111242", name:"SULFATO DE ALUMÍNIO",               unit:"KG",type:"sólido", supplier:"QUIMICA CREDIE LTDA",  leadTime:15,criticality:"Alta",
+   totEnt:81375,    totSai:78250,    estFin:3125,   consDia:652.08},
+  {id:2,  codeSAP:"60493888", name:"CLORETO DE SÓDIO",                  unit:"KG",type:"sólido", supplier:"",                     leadTime:10,criticality:"Alta",
+   totEnt:378815,   totSai:365815,   estFin:13000,  consDia:3048.46},
+  {id:3,  codeSAP:"60502298", name:"ÁCIDO CÍTRICO",                     unit:"KG",type:"sólido", supplier:"A M QUIMICA INDUST",   leadTime:10,criticality:"Média",
+   totEnt:21200,    totSai:18850,    estFin:2350,   consDia:157.08},
+  {id:4,  codeSAP:"62107397", name:"FLOCULANTE SC 25KG",                unit:"KG",type:"sólido", supplier:"",                     leadTime:20,criticality:"Alta",
+   totEnt:19725,    totSai:19725,    estFin:0,      consDia:164.38},
+  {id:5,  codeSAP:"62775833", name:"FLOCULANTE CNT 1000L",              unit:"KG",type:"líquido",supplier:"QQS COMERCIO",         leadTime:20,criticality:"Alta",
+   totEnt:360500,   totSai:360500,   estFin:0,      consDia:3004.17},
+  {id:6,  codeSAP:"62789580", name:"HIDRÓXIDO DE SÓDIO 50%",            unit:"KG",type:"líquido",supplier:"A M QUIMICA INDUST",   leadTime:15,criticality:"Alta",
+   totEnt:539959.18,totSai:529459.18,estFin:10500,  consDia:4412.16},
+  {id:7,  codeSAP:"62789876", name:"HIPOCLORITO DE SÓDIO",              unit:"KG",type:"líquido",supplier:"A M QUIMICA INDUST",   leadTime:7, criticality:"Alta",
+   totEnt:24120,    totSai:18540,    estFin:5580,   consDia:154.50},
+  {id:8,  codeSAP:"62790049", name:"HIPOCLORITO DE CÁLCIO 65%",         unit:"KG",type:"sólido", supplier:"",                     leadTime:10,criticality:"Média",
+   totEnt:2435,     totSai:1950,     estFin:485,    consDia:16.25},
+  {id:9,  codeSAP:"62790539", name:"ÁCIDO CLORÍDRICO 30%",              unit:"KG",type:"líquido",supplier:"",                     leadTime:12,criticality:"Alta",
+   totEnt:14940,    totSai:12790,    estFin:2150,   consDia:106.58},
+  {id:10, codeSAP:"62794703", name:"INIBIDOR DE CORROSÃO FOSFATO",      unit:"KG",type:"líquido",supplier:"",                     leadTime:25,criticality:"Alta",
+   totEnt:18000,    totSai:15000,    estFin:3000,   consDia:125.00},
+  {id:11, codeSAP:"62794704", name:"DISPERSANTE DE INCRUSTAÇÃO",        unit:"KG",type:"líquido",supplier:"",                     leadTime:25,criticality:"Média",
+   totEnt:16200,    totSai:10100,    estFin:6100,   consDia:84.17},
+  {id:12, codeSAP:"62794705", name:"INIBIDOR CORROSÃO METAIS AMARELOS", unit:"KG",type:"líquido",supplier:"",                     leadTime:25,criticality:"Média",
+   totEnt:12600,    totSai:8400,     estFin:4200,   consDia:70.00},
+  {id:13, codeSAP:"62794706", name:"INIBIDOR DE CORROSÃO ZINCO",        unit:"KG",type:"líquido",supplier:"",                     leadTime:25,criticality:"Alta",
+   totEnt:16200,    totSai:12200,    estFin:4000,   consDia:101.67},
+  {id:14, codeSAP:"62794831", name:"POLÍMERO CATIÔNICO IBC 1000L",      unit:"KG",type:"líquido",supplier:"",                     leadTime:30,criticality:"Alta",
+   totEnt:7200,     totSai:7198,     estFin:2,      consDia:59.98},
 ];
 
-/* Movimentos detalhados reais do MB51 (tipos 201+261=saída, 101=entrada compra) */
+/* Movimentos detalhados MB51 */
 const initialMovements = [
-  // ── SULFATO DE ALUMÍNIO ──
-  {id:1001,pid:1,date:"2026-03-03",tipo:"201",qty:-3000,dep:"BQ3",doc:"4901122206",obs:"Saída consumo"},
-  {id:1002,pid:1,date:"2026-03-06",tipo:"201",qty:-1000,dep:"BQ3",doc:"4901124729",obs:"Saída consumo"},
-  {id:1003,pid:1,date:"2026-03-26",tipo:"201",qty:-1125,dep:"BQ3",doc:"4901139522",obs:"Saída consumo"},
-  {id:1004,pid:1,date:"2026-04-10",tipo:"201",qty:-1125,dep:"BQ3",doc:"4901148905",obs:"Saída consumo"},
-  {id:1005,pid:1,date:"2026-04-17",tipo:"201",qty:-1125,dep:"BQ3",doc:"4901154042",obs:"Saída consumo"},
-  {id:1006,pid:1,date:"2026-04-27",tipo:"201",qty:-1500,dep:"BQ3",doc:"4901160501",obs:"Saída consumo"},
-  {id:1007,pid:1,date:"2026-02-19",tipo:"101",qty:6000, dep:"RC01",doc:"5000417520",obs:"Entrada compra NF"},
-  {id:1008,pid:1,date:"2026-04-24",tipo:"101",qty:3000, dep:"RC01",doc:"5000437857",obs:"Entrada compra NF"},
-  // ── ÁCIDO CÍTRICO ──
-  {id:2001,pid:3,date:"2026-01-19",tipo:"201",qty:-400, dep:"BQ3",doc:"4901090113",obs:"Saída consumo"},
-  {id:2002,pid:3,date:"2026-02-13",tipo:"201",qty:-1250,dep:"BQ3",doc:"4901108707",obs:"Saída consumo"},
-  {id:2003,pid:3,date:"2026-02-12",tipo:"101",qty:1800, dep:"RC01",doc:"5000415761",obs:"Entrada compra NF"},
-  {id:2004,pid:3,date:"2026-04-24",tipo:"101",qty:1800, dep:"RC01",doc:"5000437869",obs:"Entrada compra NF"},
-  // ── FLOCULANTE SC 25KG ──
-  {id:3001,pid:4,date:"2026-01-09",tipo:"201",qty:-125, dep:"BQ3",doc:"4901083634",obs:"Saída consumo"},
-  {id:3002,pid:4,date:"2026-01-19",tipo:"201",qty:-200, dep:"BQ3",doc:"4901090113",obs:"Saída consumo"},
-  // ── FLOCULANTE CNT 1000L ──
-  {id:4001,pid:5,date:"2026-01-09",tipo:"201",qty:-1000, dep:"BQ3",doc:"4901083841",obs:"Saída consumo"},
-  {id:4002,pid:5,date:"2026-01-19",tipo:"201",qty:-2000, dep:"BQ3",doc:"4901090113",obs:"Saída consumo"},
-  {id:4003,pid:5,date:"2026-02-06",tipo:"201",qty:-2000, dep:"BQ3",doc:"4901103001",obs:"Saída consumo"},
-  {id:4004,pid:5,date:"2026-02-19",tipo:"201",qty:-2000, dep:"BQ3",doc:"4901113197",obs:"Saída consumo"},
-  {id:4005,pid:5,date:"2026-03-06",tipo:"201",qty:-1000, dep:"BQ3",doc:"4901124729",obs:"Saída consumo"},
-  {id:4006,pid:5,date:"2026-03-13",tipo:"201",qty:-2000, dep:"BQ3",doc:"4901129556",obs:"Saída consumo"},
-  {id:4007,pid:5,date:"2026-04-24",tipo:"201",qty:-1500, dep:"RC01",doc:"4901159352",obs:"Saída consumo"},
-  {id:4008,pid:5,date:"2026-04-24",tipo:"101",qty:1500,  dep:"RC01",doc:"5000437901",obs:"Entrada compra NF"},
-  // ── HIDRÓXIDO DE SÓDIO 50% ──
-  {id:5001,pid:6,date:"2026-01-09",tipo:"201",qty:-1530, dep:"BQ3",doc:"4901083634",obs:"Saída consumo"},
-  {id:5002,pid:6,date:"2026-02-11",tipo:"261",qty:-2000, dep:"BQ3",doc:"4901107347",obs:"Saída para ordem"},
-  {id:5003,pid:6,date:"2026-02-12",tipo:"261",qty:-2000, dep:"BQ3",doc:"4901107717",obs:"Saída para ordem"},
-  {id:5004,pid:6,date:"2026-03-04",tipo:"201",qty:-9,    dep:"BQ3",doc:"4901122964",obs:"Saída consumo (ajuste)"},
-  {id:5005,pid:6,date:"2026-03-06",tipo:"201",qty:-1530, dep:"BQ3",doc:"4901124295",obs:"Saída consumo"},
-  {id:5006,pid:6,date:"2026-03-06",tipo:"201",qty:-7650, dep:"BQ3",doc:"4901124331",obs:"Saída consumo"},
-  {id:5007,pid:6,date:"2026-03-06",tipo:"201",qty:-7650, dep:"BQ3",doc:"4901124412",obs:"Saída consumo"},
-  {id:5008,pid:6,date:"2026-03-20",tipo:"201",qty:-1530, dep:"BQ3",doc:"4901135219",obs:"Saída consumo"},
-  {id:5009,pid:6,date:"2026-04-09",tipo:"201",qty:-4000, dep:"BQ3",doc:"4901148489",obs:"Saída consumo"},
-  {id:5010,pid:6,date:"2026-04-13",tipo:"201",qty:-3000, dep:"BQ3",doc:"4901151003",obs:"Saída consumo"},
-  {id:5011,pid:6,date:"2026-04-15",tipo:"201",qty:-1530, dep:"BQ3",doc:"4901152426",obs:"Saída consumo"},
-  {id:5012,pid:6,date:"2026-04-30",tipo:"201",qty:-9000, dep:"BQ3",doc:"4901162951",obs:"Saída consumo"},
-  {id:5013,pid:6,date:"2026-04-30",tipo:"201",qty:-4470, dep:"BQ3",doc:"4901163292",obs:"Saída consumo"},
-  {id:5014,pid:6,date:"2026-02-19",tipo:"101",qty:9180,  dep:"RC01",doc:"5000417551",obs:"Entrada compra NF"},
-  {id:5015,pid:6,date:"2026-04-07",tipo:"101",qty:19500, dep:"RC01",doc:"5000431941",obs:"Entrada compra NF"},
-  // ── HIPOCLORITO DE SÓDIO ──
-  {id:6001,pid:7,date:"2026-03-19",tipo:"201",qty:-1440, dep:"BQ3",doc:"4901133994",obs:"Saída consumo"},
-  {id:6002,pid:7,date:"2026-04-13",tipo:"201",qty:-1980, dep:"BQ3",doc:"4901150980",obs:"Saída consumo"},
-  {id:6003,pid:7,date:"2026-02-20",tipo:"101",qty:9000,  dep:"RC01",doc:"5000417807",obs:"Entrada compra NF"},
-  // ── INIBIDOR DE CORROSÃO FOSFATO ──
-  {id:7001,pid:10,date:"2026-01-06",tipo:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
-  {id:7002,pid:10,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901137358",obs:"Saída consumo"},
-  {id:7003,pid:10,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
-  {id:7004,pid:10,date:"2026-03-31",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
-  {id:7005,pid:10,date:"2026-04-07",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901146632",obs:"Saída consumo"},
-  {id:7006,pid:10,date:"2026-04-15",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901152426",obs:"Saída consumo"},
-  {id:7007,pid:10,date:"2026-03-23",tipo:"101",qty:5000, dep:"RC01",doc:"5000428019",obs:"Entrada compra NF"},
-  {id:7008,pid:10,date:"2026-04-24",tipo:"101",qty:3000, dep:"RC01",doc:"5000437847",obs:"Entrada compra NF"},
-  // ── DISPERSANTE DE INCRUSTAÇÃO ──
-  {id:8001,pid:11,date:"2026-01-06",tipo:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
-  {id:8002,pid:11,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
-  {id:8003,pid:11,date:"2026-03-23",tipo:"101",qty:4400, dep:"RC01",doc:"5000428019",obs:"Entrada compra NF"},
-  {id:8004,pid:11,date:"2026-04-24",tipo:"101",qty:2700, dep:"RC01",doc:"5000437847",obs:"Entrada compra NF"},
-  // ── INIBIDOR CORROSÃO METAIS AMARELOS ──
-  {id:9001,pid:12,date:"2026-01-06",tipo:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
-  {id:9002,pid:12,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
-  {id:9003,pid:12,date:"2026-03-31",tipo:"201",qty:-100, dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
-  {id:9004,pid:12,date:"2026-03-23",tipo:"101",qty:3200, dep:"RC01",doc:"5000428019",obs:"Entrada compra NF"},
-  {id:9005,pid:12,date:"2026-04-24",tipo:"101",qty:2100, dep:"RC01",doc:"5000437847",obs:"Entrada compra NF"},
-  // ── INIBIDOR DE CORROSÃO ZINCO ──
-  {id:10001,pid:13,date:"2026-01-06",tipo:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
-  {id:10002,pid:13,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
-  {id:10003,pid:13,date:"2026-03-31",tipo:"201",qty:-1200,dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
-  {id:10004,pid:13,date:"2026-04-24",tipo:"201",qty:-900, dep:"BQ3", doc:"4901159285",obs:"Saída consumo"},
-  {id:10005,pid:13,date:"2026-03-23",tipo:"101",qty:4400, dep:"RC01",doc:"5000428019",obs:"Entrada compra NF"},
-  {id:10006,pid:13,date:"2026-04-24",tipo:"101",qty:2700, dep:"RC01",doc:"5000437847",obs:"Entrada compra NF"},
-  // ── POLÍMERO CATIÔNICO IBC 1000L ──
-  {id:11001,pid:14,date:"2026-03-24",tipo:"201",qty:-1000,dep:"BQ3",doc:"4901137376",obs:"Saída consumo"},
-  {id:11002,pid:14,date:"2026-03-31",tipo:"201",qty:-2598,dep:"BQ3",doc:"4901142610",obs:"Saída consumo"},
-  {id:11003,pid:14,date:"2026-03-23",tipo:"101",qty:3600, dep:"RC01",doc:"5000428019",obs:"Entrada compra NF"},
+  // SULFATO DE ALUMÍNIO
+  {id:1001,pid:1,date:"2026-02-19",tmov:"101",qty: 6000, dep:"RC01",doc:"5000417520",obs:"Compra NF"},
+  {id:1002,pid:1,date:"2026-03-03",tmov:"201",qty:-3000, dep:"BQ3", doc:"4901122206",obs:"Saída consumo"},
+  {id:1003,pid:1,date:"2026-03-06",tmov:"201",qty:-1000, dep:"BQ3", doc:"4901124729",obs:"Saída consumo"},
+  {id:1004,pid:1,date:"2026-03-26",tmov:"201",qty:-1125, dep:"BQ3", doc:"4901139522",obs:"Saída consumo"},
+  {id:1005,pid:1,date:"2026-04-10",tmov:"201",qty:-1125, dep:"BQ3", doc:"4901148905",obs:"Saída consumo"},
+  {id:1006,pid:1,date:"2026-04-17",tmov:"201",qty:-1125, dep:"BQ3", doc:"4901154042",obs:"Saída consumo"},
+  {id:1007,pid:1,date:"2026-04-24",tmov:"101",qty: 3000, dep:"RC01",doc:"5000437857",obs:"Compra NF"},
+  {id:1008,pid:1,date:"2026-04-27",tmov:"201",qty:-1500, dep:"BQ3", doc:"4901160501",obs:"Saída consumo"},
+  // ÁCIDO CÍTRICO
+  {id:2001,pid:3,date:"2026-01-19",tmov:"201",qty:-400,  dep:"BQ3", doc:"4901090113",obs:"Saída consumo"},
+  {id:2002,pid:3,date:"2026-02-12",tmov:"101",qty: 1800, dep:"RC01",doc:"5000415761",obs:"Compra NF"},
+  {id:2003,pid:3,date:"2026-02-13",tmov:"201",qty:-1250, dep:"BQ3", doc:"4901108707",obs:"Saída consumo"},
+  {id:2004,pid:3,date:"2026-04-24",tmov:"101",qty: 1800, dep:"RC01",doc:"5000437869",obs:"Compra NF"},
+  // FLOCULANTE SC 25KG
+  {id:3001,pid:4,date:"2026-01-09",tmov:"201",qty:-125,  dep:"BQ3", doc:"4901083634",obs:"Saída consumo"},
+  {id:3002,pid:4,date:"2026-01-19",tmov:"201",qty:-200,  dep:"BQ3", doc:"4901090113",obs:"Saída consumo"},
+  // FLOCULANTE CNT 1000L
+  {id:4001,pid:5,date:"2026-01-09",tmov:"201",qty:-1000, dep:"BQ3", doc:"4901083841",obs:"Saída consumo"},
+  {id:4002,pid:5,date:"2026-01-19",tmov:"201",qty:-2000, dep:"BQ3", doc:"4901090113",obs:"Saída consumo"},
+  {id:4003,pid:5,date:"2026-02-06",tmov:"201",qty:-2000, dep:"BQ3", doc:"4901103001",obs:"Saída consumo"},
+  {id:4004,pid:5,date:"2026-02-19",tmov:"201",qty:-2000, dep:"BQ3", doc:"4901113197",obs:"Saída consumo"},
+  {id:4005,pid:5,date:"2026-03-06",tmov:"201",qty:-1000, dep:"BQ3", doc:"4901124729",obs:"Saída consumo"},
+  {id:4006,pid:5,date:"2026-03-13",tmov:"201",qty:-2000, dep:"BQ3", doc:"4901129556",obs:"Saída consumo"},
+  {id:4007,pid:5,date:"2026-04-24",tmov:"101",qty: 1500, dep:"RC01",doc:"5000437901",obs:"Compra NF"},
+  {id:4008,pid:5,date:"2026-04-24",tmov:"201",qty:-1500, dep:"RC01",doc:"4901159352",obs:"Saída consumo"},
+  // HIDRÓXIDO DE SÓDIO 50%
+  {id:5001,pid:6,date:"2026-01-09",tmov:"201",qty:-1530,    dep:"BQ3", doc:"4901083634",obs:"Saída consumo"},
+  {id:5002,pid:6,date:"2026-02-11",tmov:"261",qty:-2000,    dep:"BQ3", doc:"4901107347",obs:"Saída para ordem"},
+  {id:5003,pid:6,date:"2026-02-12",tmov:"261",qty:-2000,    dep:"BQ3", doc:"4901107717",obs:"Saída para ordem"},
+  {id:5004,pid:6,date:"2026-02-19",tmov:"101",qty: 9180,    dep:"RC01",doc:"5000417551",obs:"Compra NF"},
+  {id:5005,pid:6,date:"2026-03-04",tmov:"201",qty:-9.18,    dep:"BQ3", doc:"4901122964",obs:"Saída consumo (ajuste)"},
+  {id:5006,pid:6,date:"2026-03-06",tmov:"201",qty:-1530,    dep:"BQ3", doc:"4901124295",obs:"Saída consumo"},
+  {id:5007,pid:6,date:"2026-03-06",tmov:"201",qty:-7650,    dep:"BQ3", doc:"4901124331",obs:"Saída consumo"},
+  {id:5008,pid:6,date:"2026-03-06",tmov:"201",qty:-7650,    dep:"BQ3", doc:"4901124412",obs:"Saída consumo"},
+  {id:5009,pid:6,date:"2026-03-20",tmov:"201",qty:-1530,    dep:"BQ3", doc:"4901135219",obs:"Saída consumo"},
+  {id:5010,pid:6,date:"2026-04-07",tmov:"101",qty: 19500,   dep:"RC01",doc:"5000431941",obs:"Compra NF"},
+  {id:5011,pid:6,date:"2026-04-09",tmov:"201",qty:-4000,    dep:"BQ3", doc:"4901148489",obs:"Saída consumo"},
+  {id:5012,pid:6,date:"2026-04-13",tmov:"201",qty:-3000,    dep:"BQ3", doc:"4901151003",obs:"Saída consumo"},
+  {id:5013,pid:6,date:"2026-04-15",tmov:"201",qty:-1530,    dep:"BQ3", doc:"4901152426",obs:"Saída consumo"},
+  {id:5014,pid:6,date:"2026-04-30",tmov:"201",qty:-9000,    dep:"BQ3", doc:"4901162951",obs:"Saída consumo"},
+  {id:5015,pid:6,date:"2026-04-30",tmov:"201",qty:-4470,    dep:"BQ3", doc:"4901163292",obs:"Saída consumo"},
+  // HIPOCLORITO DE SÓDIO
+  {id:6001,pid:7,date:"2026-02-20",tmov:"101",qty: 9000, dep:"RC01",doc:"5000417807",obs:"Compra NF"},
+  {id:6002,pid:7,date:"2026-03-19",tmov:"201",qty:-1440, dep:"BQ3", doc:"4901133994",obs:"Saída consumo"},
+  {id:6003,pid:7,date:"2026-04-13",tmov:"201",qty:-1980, dep:"BQ3", doc:"4901150980",obs:"Saída consumo"},
+  // INIBIDOR DE CORROSÃO FOSFATO
+  {id:7001,pid:10,date:"2026-01-06",tmov:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
+  {id:7002,pid:10,date:"2026-03-23",tmov:"101",qty: 5000,dep:"RC01",doc:"5000428019",obs:"Compra NF"},
+  {id:7003,pid:10,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137358",obs:"Saída consumo"},
+  {id:7004,pid:10,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
+  {id:7005,pid:10,date:"2026-03-31",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
+  {id:7006,pid:10,date:"2026-04-07",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901146632",obs:"Saída consumo"},
+  {id:7007,pid:10,date:"2026-04-15",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901152426",obs:"Saída consumo"},
+  {id:7008,pid:10,date:"2026-04-24",tmov:"101",qty: 3000,dep:"RC01",doc:"5000437847",obs:"Compra NF"},
+  // DISPERSANTE
+  {id:8001,pid:11,date:"2026-01-06",tmov:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
+  {id:8002,pid:11,date:"2026-03-23",tmov:"101",qty: 4400,dep:"RC01",doc:"5000428019",obs:"Compra NF"},
+  {id:8003,pid:11,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
+  {id:8004,pid:11,date:"2026-04-24",tmov:"101",qty: 2700,dep:"RC01",doc:"5000437847",obs:"Compra NF"},
+  // INIBIDOR METAIS AMARELOS
+  {id:9001,pid:12,date:"2026-01-06",tmov:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
+  {id:9002,pid:12,date:"2026-03-23",tmov:"101",qty: 3200,dep:"RC01",doc:"5000428019",obs:"Compra NF"},
+  {id:9003,pid:12,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
+  {id:9004,pid:12,date:"2026-03-31",tmov:"201",qty:-100, dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
+  {id:9005,pid:12,date:"2026-04-24",tmov:"101",qty: 2100,dep:"RC01",doc:"5000437847",obs:"Compra NF"},
+  // INIBIDOR ZINCO
+  {id:10001,pid:13,date:"2026-01-06",tmov:"201",qty:-1000,dep:"DIF1",doc:"4901081064",obs:"Saída consumo"},
+  {id:10002,pid:13,date:"2026-03-23",tmov:"101",qty: 4400,dep:"RC01",doc:"5000428019",obs:"Compra NF"},
+  {id:10003,pid:13,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
+  {id:10004,pid:13,date:"2026-03-31",tmov:"201",qty:-1200,dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
+  {id:10005,pid:13,date:"2026-04-24",tmov:"101",qty: 2700,dep:"RC01",doc:"5000437847",obs:"Compra NF"},
+  {id:10006,pid:13,date:"2026-04-24",tmov:"201",qty:-900, dep:"BQ3", doc:"4901159285",obs:"Saída consumo"},
+  // POLÍMERO CATIÔNICO
+  {id:11001,pid:14,date:"2026-03-23",tmov:"101",qty: 3600,dep:"RC01",doc:"5000428019",obs:"Compra NF"},
+  {id:11002,pid:14,date:"2026-03-24",tmov:"201",qty:-1000,dep:"BQ3", doc:"4901137376",obs:"Saída consumo"},
+  {id:11003,pid:14,date:"2026-03-31",tmov:"201",qty:-2598,dep:"BQ3", doc:"4901142610",obs:"Saída consumo"},
 ];
 
 const TABS = ["Dashboard","Produtos","Movimentos","Importar SAP","Alertas","Relatórios"];
-const MESES = ["2026-01","2026-02","2026-03","2026-04","2026-05"];
-const MESES_LABEL = {
-  "2026-01":"Jan/26","2026-02":"Fev/26","2026-03":"Mar/26","2026-04":"Abr/26","2026-05":"Mai/26"
-};
 
-// ── helpers ──
-const fmtN = (n,dec=0) => Number(n).toLocaleString("pt-BR",{minimumFractionDigits:dec,maximumFractionDigits:dec});
-const fmtDate = s => { if(!s)return"—"; const[y,m,d]=s.split("-"); return`${d}/${m}/${y}`; };
-const TH = { textAlign:"left",padding:"9px 14px",fontSize:10,color:C.gray400,fontWeight:700,letterSpacing:0.8,textTransform:"uppercase",borderBottom:`1px solid ${C.gray100}`,whiteSpace:"nowrap" };
-const inp = { border:`1.5px solid ${C.gray200}`,borderRadius:8,padding:"8px 12px",fontSize:14,color:C.gray900,background:C.white,outline:"none",width:"100%",boxSizing:"border-box",fontFamily:"inherit" };
-const btnP = { background:C.red,color:C.white,border:"none",borderRadius:8,padding:"9px 20px",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit" };
-const btnS = { background:C.white,color:C.gray600,border:`1.5px solid ${C.gray200}`,borderRadius:8,padding:"9px 20px",fontWeight:600,fontSize:13,cursor:"pointer",fontFamily:"inherit" };
+/* ─── helpers ─── */
+const N = (v,d=0) => Number(v).toLocaleString("pt-BR",{minimumFractionDigits:d,maximumFractionDigits:d});
+const D = s => { if(!s)return"—"; const[y,m,d]=s.split("-"); return`${d}/${m}/${y}`; };
+const TH = {textAlign:"left",padding:"9px 14px",fontSize:10,color:C.gray400,fontWeight:700,letterSpacing:.8,textTransform:"uppercase",borderBottom:`1px solid ${C.gray100}`,whiteSpace:"nowrap"};
+const inp = {border:`1.5px solid ${C.gray200}`,borderRadius:8,padding:"8px 12px",fontSize:13,color:C.gray900,background:C.white,outline:"none",width:"100%",boxSizing:"border-box",fontFamily:"inherit"};
+const btnP = {background:C.red,color:C.white,border:"none",borderRadius:8,padding:"8px 18px",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"};
+const btnS = {background:C.white,color:C.gray600,border:`1.5px solid ${C.gray200}`,borderRadius:8,padding:"8px 18px",fontWeight:600,fontSize:13,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"};
 
-function StatusBadge({days}){
-  if(days>=60||days===9999)return<span style={{background:C.greenLight,color:C.green,padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>● ADEQUADO</span>;
-  if(days>=30)return<span style={{background:C.yellowLight,color:C.yellow,padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>◐ ATENÇÃO</span>;
-  return<span style={{background:C.redAlertLight,color:C.redAlert,padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>✕ CRÍTICO</span>;
+function Badge({days}){
+  if(days>=60||days===9999) return <span style={{background:C.greenLight,color:C.green,padding:"2px 9px",borderRadius:20,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>● ADEQUADO</span>;
+  if(days>=30) return <span style={{background:C.yellowLight,color:C.yellow,padding:"2px 9px",borderRadius:20,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>◐ ATENÇÃO</span>;
+  return <span style={{background:C.redAlertLight,color:C.redAlert,padding:"2px 9px",borderRadius:20,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>✕ CRÍTICO</span>;
 }
-function CritBadge({level}){
-  const m={Alta:{bg:C.redAlertLight,co:"#B91C1C"},Média:{bg:C.yellowLight,co:C.yellow},Baixa:{bg:C.greenLight,co:C.green}};
-  const s=m[level]||m.Baixa;
-  return<span style={{background:s.bg,color:s.co,padding:"2px 8px",borderRadius:20,fontSize:10,fontWeight:700}}>{level}</span>;
+function Crit({v}){
+  const m={Alta:{bg:C.redAlertLight,c:"#B91C1C"},Média:{bg:C.yellowLight,c:C.yellow},Baixa:{bg:C.greenLight,c:C.green}};
+  const s=m[v]||m.Baixa;
+  return <span style={{background:s.bg,color:s.c,padding:"2px 7px",borderRadius:20,fontSize:10,fontWeight:700}}>{v}</span>;
 }
-function Bar({value,max,color="#C8102E",h=6}){
-  return<div style={{background:C.gray200,borderRadius:4,height:h,width:"100%",overflow:"hidden"}}>
-    <div style={{background:color,width:`${Math.min(100,(value/(max||1))*100)}%`,height:"100%",borderRadius:4,transition:"width 0.4s"}}/>
+function Bar({v,max,color,h=6}){
+  return <div style={{background:C.gray200,borderRadius:4,height:h,overflow:"hidden"}}>
+    <div style={{background:color,width:`${Math.min(100,(v/(max||1))*100)}%`,height:"100%",borderRadius:4}}/>
   </div>;
 }
-
-function Modal({title,onClose,children,width=520}){
-  return<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}}>
-    <div style={{background:C.white,borderRadius:16,padding:28,width,maxHeight:"90vh",overflowY:"auto",boxShadow:"0 8px 40px rgba(0,0,0,0.2)"}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
-        <div style={{fontWeight:800,fontSize:16}}>{title}</div>
-        <button onClick={onClose} style={{...btnS,padding:"4px 12px",fontSize:14}}>✕</button>
+function Modal({title,onClose,children,w=520}){
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center"}}>
+    <div style={{background:C.white,borderRadius:16,padding:26,width:w,maxHeight:"90vh",overflowY:"auto",boxShadow:"0 8px 40px rgba(0,0,0,0.22)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{fontWeight:800,fontSize:15}}>{title}</div>
+        <button onClick={onClose} style={{...btnS,padding:"3px 11px",fontSize:14}}>✕</button>
       </div>
       {children}
     </div>
   </div>;
 }
 
-/* ══ IMPORTAR SAP ══ */
-function ImportSAP({products,onImport}){
-  const[step,setStep]=useState("upload");
-  const[rawRows,setRawRows]=useState([]);
-  const[headers,setHeaders]=useState([]);
-  const[map,setMap]=useState({material:"",nome:"",data:"",qtd:"",tipo:""});
-  const[importDate,setImportDate]=useState(new Date().toISOString().slice(0,10));
-  const[preview,setPreview]=useState([]);
-  const[fileName,setFileName]=useState("");
-  const[loading,setLoading]=useState(false);
-  const[result,setResult]=useState(null);
-  const fileRef=useRef();
+/* ══════════════════════════════════════════════
+   IMPORTAR SAP — suporta múltiplos arquivos
+   Detecta automaticamente: MB5B, MB51, Extrato
+══════════════════════════════════════════════ */
+function ImportSAP({products, onImport}){
+  const [files, setFiles] = useState([]);   // [{name, rows, headers, format}]
+  const [step, setStep] = useState("drop"); // drop | review | done
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const fileRef = useRef();
 
-  const handleFile=file=>{
-    if(!file)return;
-    setFileName(file.name);setStep("upload");setResult(null);
-    loadSheetJS(()=>{
-      const r=new FileReader();
-      r.onload=e=>{
-        const wb=window.XLSX.read(e.target.result,{type:"array"});
-        const ws=wb.Sheets[wb.SheetNames[0]];
-        const data=window.XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:""});
-        let hi=0;
-        for(let i=0;i<Math.min(8,data.length);i++)
-          if(data[i].filter(c=>c!=="").length>3){hi=i;break;}
-        const hdrs=data[hi].map(h=>String(h||"").trim());
-        const rows=data.slice(hi+1).filter(r=>r.some(c=>c!==""));
-        setHeaders(hdrs);setRawRows(rows);
-        // auto-map
-        const am={material:"",nome:"",data:"",qtd:"",tipo:""};
-        hdrs.forEach((h,i)=>{
-          const l=h.toLowerCase();
-          if(l.includes("material")&&!l.includes("texto"))am.material=String(i);
-          if(l.includes("texto breve")||l.includes("descrição"))am.nome=String(i);
-          if(l.includes("lançamento")||l.includes("lçto"))am.data=String(i);
-          if(l.includes("estoque final"))am.qtd=String(i);
-          else if(!am.qtd&&l.includes("qtd")&&l.includes("registro"))am.qtd=String(i);
-          if(l.includes("tipo de movimento")||l.includes("tmv")||l==="tmv")am.tipo=String(i);
-        });
-        setMap(am);setStep("map");
-      };
-      r.readAsArrayBuffer(file);
-    });
+  const safeFloat = v => {
+    if(v==null) return 0;
+    const s = String(v).trim();
+    // Float puro (ex: 539959.18)
+    if(/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
+    // Formato BR: pontos=milhar, vírgula=decimal
+    return parseFloat(s.replace(/\./g,"").replace(",",".")) || 0;
   };
 
-  const toDate=v=>{
-    if(typeof v==="number"&&v>1000)return new Date((v-25569)*86400000).toISOString().slice(0,10);
-    if(v instanceof Date)return v.toISOString().slice(0,10);
-    if(typeof v==="string"&&v.includes(".")){
-      const[d,m,y]=v.trim().split(".");
-      if(y&&m&&d)return`${y.length===4?y:"20"+y}-${m.padStart(2,"0")}-${d.padStart(2,"0")}`;
+  const toDateStr = v => {
+    if(!v) return null;
+    if(typeof v==="number"&&v>1000){
+      const d=new Date((v-25569)*86400000);
+      return d.toISOString().slice(0,10);
+    }
+    if(v instanceof Date) return v.toISOString().slice(0,10);
+    if(typeof v==="string"){
+      const s=v.trim();
+      // DD.MM.YYYY
+      const m1=s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+      if(m1) return `${m1[3]}-${m1[2]}-${m1[1]}`;
+      // YYYY-MM-DD
+      if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
     }
     return null;
   };
 
-  const buildPreview=()=>{
-    const parsed=[];
-    rawRows.slice(0,1000).forEach(row=>{
-      const matRaw=row[Number(map.material)];
-      if(!matRaw)return;
-      const matCode=String(matRaw).trim();
-      if(!matCode||!matCode.match(/\d{5,}/))return;
-      const nomeRaw=String(row[Number(map.nome)]||"").trim();
-      const qtdRaw=row[Number(map.qtd)];
-      const tipoRaw=map.tipo?String(row[Number(map.tipo)]||"").trim():"";
-      const dataRaw=map.data?row[Number(map.data)]:importDate;
-      if(qtdRaw===""||qtdRaw===null||qtdRaw===undefined)return;
-      const qtd=parseFloat(String(qtdRaw).replace(/\./g,"").replace(",","."));
-      if(isNaN(qtd)||qtd===0)return;
-      const dateStr=toDate(dataRaw)||importDate;
-      const prod=products.find(p=>p.codeSAP===matCode);
-      // Classificar tipo de movimento
-      let type="saida";
-      if(tipoRaw===""){ type=qtd>0?"saldo":"saida"; }
-      else if(["101"].includes(tipoRaw))type="entrada";
-      else if(["201","261"].includes(tipoRaw))type="saida";
-      else if(tipoRaw==="202")type="entrada";
-      else type=qtd<0?"saida":"entrada";
-      parsed.push({codeSAP:matCode,nome:nomeRaw.slice(0,40)||matCode,date:dateStr,qty:Math.abs(qtd),type,tipoMov:tipoRaw,matched:!!prod,productId:prod?.id});
-    });
-    setPreview(parsed);setStep("preview");
+  /* Detecta o formato e extrai registros de qualquer planilha SAP */
+  const parseSheet = (data, filename) => {
+    // Encontra linha de cabeçalho
+    let hi = 0;
+    for(let i=0;i<Math.min(8,data.length);i++){
+      if(data[i].filter(c=>c!=="&&"&&c!==null&&c!=="").length > 3){hi=i;break;}
+    }
+    const headers = data[hi].map(h=>String(h||"").trim().toLowerCase());
+    const rows = data.slice(hi+1);
+
+    // Detectar formato
+    const isMB5B  = headers.some(h=>h.includes("estoque final")||h.includes("totais qtds"));
+    const isMB51  = headers.some(h=>h.includes("tipo de movimento")||h.includes("txt.tipo"));
+    const isExtrato = !isMB5B && !isMB51 && headers.some(h=>h.includes("tmv")||h.includes("doc.mat"));
+
+    const records = [];
+
+    if(isMB5B){
+      // Formato: Centro Mat DataDe DataAte EstIni TotEnt TotSai EstFin UMB Nome
+      const iMat=1, iDataDe=2, iDataAte=3, iEstIni=4, iTotEnt=5, iTotSai=6, iEstFin=7, iUMB=8, iNome=9;
+      rows.forEach(r=>{
+        const mat=String(r[iMat]||"").trim();
+        if(!mat||!/^\d{6,}$/.test(mat)) return;
+        const dIni=toDateStr(r[iDataDe])||"2026-01-01";
+        const dFim=toDateStr(r[iDataAte])||"2026-05-01";
+        const dias=Math.max(1,Math.round((new Date(dFim)-new Date(dIni))/(864e5)));
+        const totEnt=safeFloat(r[iTotEnt]);
+        const totSai=Math.abs(safeFloat(r[iTotSai]));
+        const estFin=safeFloat(r[iEstFin]);
+        const nome=String(r[iNome]||"").trim();
+        records.push({format:"MB5B",mat,nome,dIni,dFim,dias,totEnt,totSai,estFin,consDia:totSai/dias});
+      });
+    }
+    else if(isMB51){
+      // Formato: Centro Dep Mat Nome TipoAval TipoMov ... DtLcto Qtd UM ...
+      const iDep=1,iMat=2,iNome=3,iTMov=5,iDtLcto=14,iQtd=15;
+      rows.forEach(r=>{
+        const mat=String(r[iMat]||"").trim();
+        if(!mat||!/^\d{6,}$/.test(mat)) return;
+        const tmov=String(r[iTMov]||"").trim();
+        const dep=String(r[iDep]||"").trim();
+        const nome=String(r[iNome]||"").trim();
+        const date=toDateStr(r[iDtLcto]);
+        const qty=safeFloat(r[iQtd]);
+        if(!date||qty===0) return;
+        records.push({format:"MB51",mat,nome,dep,tmov,date,qty});
+      });
+    }
+    else if(isExtrato){
+      // Extrato por material — identifica linhas de produto e linhas de movimento
+      let curMat="",curNome="";
+      rows.forEach(r=>{
+        const c1=String(r[1]||"").trim();
+        const c8=String(r[8]||"").trim();
+        const c2=String(r[2]||"").trim();
+        // Linha de produto
+        if(/^\d{7,}$/.test(c1)&&c8&&!c8.startsWith(" ".repeat(15))){
+          curMat=c1; curNome=c8; return;
+        }
+        // Linha de movimento
+        if(curMat&&/^\d{3}$/.test(c2)){
+          const dep=c1,tmov=c2,doc=String(r[4]||"").trim();
+          const date=toDateStr(r[6]);
+          const qty=safeFloat(r[7]);
+          if(date&&qty!==0)
+            records.push({format:"Extrato",mat:curMat,nome:curNome,dep,tmov,date,qty});
+        }
+      });
+    }
+    return {name:filename, format:isMB5B?"MB5B":isMB51?"MB51":"Extrato", records, count:records.length};
   };
 
-  const doImport=()=>{
+  const handleFiles = useCallback(fileList => {
     setLoading(true);
-    const newMovs=[];const newProds=[];const tempMap={};
-    preview.forEach((row,i)=>{
-      let pid=row.productId;
-      if(!pid){
-        if(!tempMap[row.codeSAP]){
-          const np={id:Date.now()+i,name:row.nome.toUpperCase(),codeSAP:row.codeSAP,unit:"KG",type:"sólido",supplier:"",leadTime:15,criticality:"Média",estIni:0,totalEntradas:0,totalSaidas:0,estFin:0};
-          newProds.push(np);tempMap[row.codeSAP]=np.id;
-        }
-        pid=tempMap[row.codeSAP];
-      }
-      newMovs.push({id:Date.now()+i+9000,pid,date:row.date,tipo:row.tipoMov||row.type,qty:row.type==="saida"?-row.qty:row.qty,dep:"BQ3",doc:"IMPORT",obs:`Importado: ${fileName}`});
+    loadXLSX(()=>{
+      const results = [];
+      let done = 0;
+      Array.from(fileList).forEach(file=>{
+        const reader = new FileReader();
+        reader.onload = e => {
+          const wb = window.XLSX.read(e.target.result,{type:"array"});
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const data = window.XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:""});
+          results.push(parseSheet(data,file.name));
+          done++;
+          if(done===fileList.length){
+            setFiles(results);
+            setStep("review");
+            setLoading(false);
+          }
+        };
+        reader.readAsArrayBuffer(file);
+      });
     });
+  },[]);
+
+  const doImport = () => {
+    setLoading(true);
+    const newMovs=[], newProds=[], tempMap={};
+    let updatedProducts=[...products];
+
+    files.forEach(f=>{
+      f.records.forEach((rec,i)=>{
+        const prod = updatedProducts.find(p=>p.codeSAP===rec.mat)||products.find(p=>p.codeSAP===rec.mat);
+
+        if(rec.format==="MB5B"){
+          // Atualiza ou cria produto com dados MB5B
+          if(!prod&&!tempMap[rec.mat]){
+            const np={id:Date.now()+i,codeSAP:rec.mat,name:rec.nome.toUpperCase(),unit:"KG",type:"sólido",
+                      supplier:"",leadTime:15,criticality:"Média",
+                      totEnt:rec.totEnt,totSai:rec.totSai,estFin:rec.estFin,consDia:rec.consDia};
+            newProds.push(np); tempMap[rec.mat]=np.id;
+          }
+        }
+        else if(rec.format==="MB51"||rec.format==="Extrato"){
+          const isSaida=["201","261"].includes(rec.tmov)&&rec.qty<0;
+          const isEntrada=["101"].includes(rec.tmov)&&rec.qty>0;
+          if(!isSaida&&!isEntrada) return;
+          let pid = prod?.id || tempMap[rec.mat];
+          if(!pid){
+            const np={id:Date.now()+i+5000,codeSAP:rec.mat,name:rec.nome.toUpperCase(),unit:"KG",
+                      type:"sólido",supplier:"",leadTime:15,criticality:"Média",
+                      totEnt:0,totSai:0,estFin:0,consDia:0};
+            newProds.push(np); tempMap[rec.mat]=np.id; pid=np.id;
+          }
+          newMovs.push({id:Date.now()+i+9000,pid,date:rec.date,tmov:rec.tmov,
+                        qty:rec.qty,dep:rec.dep||"BQ3",doc:"IMPORT",obs:`Importado: ${f.name}`});
+        }
+      });
+    });
+
     setTimeout(()=>{
-      onImport(newMovs,newProds,fileName);
-      setResult({added:newMovs.length,newProds:newProds.length});
-      setLoading(false);setStep("done");
+      onImport(newMovs,newProds,files.map(f=>f.name).join(", "));
+      setResult({movs:newMovs.length,prods:newProds.length,files:files.length});
+      setLoading(false); setStep("done");
     },600);
   };
 
-  const steps=["upload","map","preview","done"];
-  const stepLabels=["1. Arquivo","2. Colunas","3. Revisão","4. Concluído"];
+  const totalRecs = files.reduce((s,f)=>s+f.count,0);
 
-  return<div>
+  return <div>
     <div style={{marginBottom:20}}>
-      <div style={{fontSize:20,fontWeight:800}}>Importar Relatório SAP</div>
-      <div style={{fontSize:12,color:C.gray400,marginTop:2}}>MB51 (movimentos) · MB52/MB5B (resumo) · Qualquer extrato SAP</div>
-    </div>
-    {/* Stepper */}
-    <div style={{display:"flex",marginBottom:22,background:C.white,borderRadius:12,overflow:"hidden",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
-      {stepLabels.map((s,i)=>{const act=steps[i]===step;const done=steps.indexOf(step)>i;return<div key={s} style={{flex:1,padding:"12px 0",textAlign:"center",fontSize:12,fontWeight:act?700:500,color:act?C.red:done?C.green:C.gray400,background:act?C.redLight:done?C.greenLight:"transparent",borderBottom:act?`2px solid ${C.red}`:done?`2px solid ${C.green}`:`2px solid ${C.gray200}`}}>{done?"✓ ":""}{s}</div>;})}
+      <div style={{fontSize:20,fontWeight:800}}>Importar Relatórios SAP</div>
+      <div style={{fontSize:11,color:C.gray400,marginTop:2}}>
+        Suporta <b>múltiplos arquivos simultâneos</b> · MB5B · MB51 · Extrato — detecção automática de formato
+      </div>
     </div>
 
-    {step==="upload"&&<div>
-      <div onClick={()=>fileRef.current.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();handleFile(e.dataTransfer.files[0]);}}
-        style={{border:`2px dashed ${C.gray300}`,borderRadius:16,padding:52,textAlign:"center",cursor:"pointer",background:C.gray50}}>
-        <div style={{fontSize:42,marginBottom:10}}>📊</div>
-        <div style={{fontWeight:700,fontSize:16,marginBottom:4}}>Arraste o arquivo Excel do SAP aqui</div>
-        <div style={{color:C.gray400,fontSize:13,marginBottom:14}}>ou clique para selecionar · .xlsx</div>
-        <div style={{display:"inline-block",...btnP}}>Selecionar arquivo</div>
-        <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+    {/* Steps */}
+    <div style={{display:"flex",marginBottom:20,background:C.white,borderRadius:12,overflow:"hidden",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+      {["1. Selecionar","2. Revisar","3. Concluído"].map((s,i)=>{
+        const keys=["drop","review","done"];
+        const act=keys[i]===step, done=keys.indexOf(step)>i;
+        return <div key={s} style={{flex:1,padding:"11px 0",textAlign:"center",fontSize:12,fontWeight:act?700:500,
+          color:act?C.red:done?C.green:C.gray400,
+          background:act?C.redLight:done?C.greenLight:"transparent",
+          borderBottom:act?`2px solid ${C.red}`:done?`2px solid ${C.green}`:`2px solid ${C.gray200}`}}>
+          {done?"✓ ":""}{s}
+        </div>;
+      })}
+    </div>
+
+    {/* STEP 1 — Drop zone múltiplos arquivos */}
+    {step==="drop"&&<div>
+      <div
+        onDragOver={e=>e.preventDefault()}
+        onDrop={e=>{e.preventDefault();handleFiles(e.dataTransfer.files);}}
+        onClick={()=>fileRef.current.click()}
+        style={{border:`2px dashed ${C.gray300}`,borderRadius:16,padding:52,textAlign:"center",cursor:"pointer",background:C.gray50,transition:"border-color .2s"}}
+        onMouseEnter={e=>e.currentTarget.style.borderColor=C.red}
+        onMouseLeave={e=>e.currentTarget.style.borderColor=C.gray300}>
+        <div style={{fontSize:44,marginBottom:10}}>📊</div>
+        <div style={{fontWeight:800,fontSize:16,marginBottom:4}}>Arraste um ou mais arquivos SAP aqui</div>
+        <div style={{color:C.gray400,fontSize:13,marginBottom:14}}>
+          Selecione <b>múltiplos arquivos</b> de uma vez · .xlsx
+        </div>
+        <div style={{display:"inline-block",...btnP}}>
+          {loading?"Processando...":"Selecionar arquivos"}
+        </div>
+        <input ref={fileRef} type="file" accept=".xlsx,.xls" multiple style={{display:"none"}}
+          onChange={e=>handleFiles(e.target.files)}/>
       </div>
+
       <div style={{marginTop:12,display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-        {[["📋 MB51","Movimentos por documento (201=saída, 101=entrada)"],["📋 MB5B / MB52","Resumo por período (estoque inicial/final)"],["📋 Extrato","Histórico detalhado por material e depósito"]].map(([t,d])=><div key={t} style={{background:C.blueLight,borderRadius:10,padding:12}}><div style={{fontWeight:700,fontSize:12,color:C.blue,marginBottom:2}}>{t}</div><div style={{fontSize:11,color:C.blue}}>{d}</div></div>)}
-      </div>
-      <div style={{marginTop:10,background:C.greenLight,borderRadius:10,padding:10,color:C.green,fontSize:12}}>
-        <b>✓ Dados Jan–Mai 2026 já carregados</b> · {initialProducts.length} produtos · {initialMovements.length} movimentos · Fonte: MB5B + MB51 SAP
-      </div>
-    </div>}
-
-    {step==="map"&&<div>
-      <div style={{background:C.greenLight,borderRadius:8,padding:10,marginBottom:16,fontSize:13,color:C.green}}>✓ <b>{fileName}</b> · {rawRows.length} linhas · {headers.length} colunas</div>
-      <div style={{background:C.white,borderRadius:12,border:`1px solid ${C.gray200}`,padding:18,marginBottom:14}}>
-        <div style={{fontWeight:700,marginBottom:12,fontSize:14}}>Mapeamento de Colunas</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          {[{l:"Código SAP *",f:"material"},{l:"Nome/Descrição",f:"nome"},{l:"Data lançamento",f:"data"},{l:"Quantidade *",f:"qtd"},{l:"Tipo movimento",f:"tipo"}].map(({l,f})=><div key={f}>
-            <label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>{l}</label>
-            <select style={inp} value={map[f]} onChange={e=>setMap(m=>({...m,[f]:e.target.value}))}>
-              <option value="">— não usar —</option>
-              {headers.map((h,i)=><option key={i} value={String(i)}>{h||`Col ${i+1}`}</option>)}
-            </select>
-          </div>)}
-        </div>
-        <div style={{marginTop:12}}>
-          <label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Data de referência (se sem coluna de data)</label>
-          <input type="date" style={{...inp,width:210}} value={importDate} onChange={e=>setImportDate(e.target.value)}/>
-        </div>
-      </div>
-      <div style={{background:C.white,borderRadius:10,border:`1px solid ${C.gray200}`,overflow:"hidden",marginBottom:14}}>
-        <div style={{padding:"9px 14px",borderBottom:`1px solid ${C.gray100}`,fontWeight:600,fontSize:12}}>Prévia — 5 primeiras linhas</div>
-        <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-          <thead><tr>{headers.slice(0,8).map((h,i)=><th key={i} style={TH}>{h||`C${i}`}</th>)}</tr></thead>
-          <tbody>{rawRows.slice(0,5).map((r,i)=><tr key={i}>{r.slice(0,8).map((c,j)=><td key={j} style={{padding:"5px 10px",borderBottom:`1px solid ${C.gray100}`}}>{String(c||"").slice(0,18)}</td>)}</tr>)}</tbody>
-        </table></div>
-      </div>
-      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-        <button style={btnS} onClick={()=>setStep("upload")}>← Voltar</button>
-        <button style={btnP} onClick={buildPreview} disabled={!map.material||!map.qtd}>Processar →</button>
-      </div>
-    </div>}
-
-    {step==="preview"&&<div>
-      <div style={{display:"flex",gap:10,marginBottom:14}}>
-        {[{v:preview.filter(p=>p.matched).length,l:"reconhecidos",bg:C.greenLight,co:C.green},{v:preview.filter(p=>!p.matched).length,l:"novos",bg:C.yellowLight,co:C.yellow},{v:preview.length,l:"total",bg:C.blueLight,co:C.blue}].map(k=><div key={k.l} style={{flex:1,background:k.bg,borderRadius:10,padding:12,textAlign:"center"}}>
-          <div style={{fontSize:26,fontWeight:800,color:k.co}}>{k.v}</div>
-          <div style={{fontSize:11,color:k.co}}>{k.l}</div>
+        {[
+          ["📋 MB5B","Resumo de saldos e totais do período — fonte de consumo médio"],
+          ["📋 MB51","Movimentos detalhados por documento (tipos 201, 261, 101)"],
+          ["📋 Extrato","Histórico completo por material e depósito"],
+        ].map(([t,d])=><div key={t} style={{background:C.blueLight,borderRadius:10,padding:12}}>
+          <div style={{fontWeight:700,fontSize:12,color:C.blue,marginBottom:3}}>{t}</div>
+          <div style={{fontSize:11,color:C.blue}}>{d}</div>
         </div>)}
       </div>
-      <div style={{background:C.white,borderRadius:10,border:`1px solid ${C.gray200}`,overflow:"hidden",marginBottom:12}}>
-        <div style={{padding:"9px 14px",borderBottom:`1px solid ${C.gray100}`,fontWeight:600,fontSize:12}}>Registros a importar</div>
-        <div style={{maxHeight:280,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-          <thead style={{position:"sticky",top:0}}><tr style={{background:C.gray50}}>
-            {["SAP","Produto","Data","Qtd KG","Tipo","Status"].map(h=><th key={h} style={TH}>{h}</th>)}
-          </tr></thead>
-          <tbody>{preview.map((r,i)=><tr key={i} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-            <td style={{padding:"5px 12px",fontFamily:"monospace",fontSize:10}}>{r.codeSAP}</td>
-            <td style={{padding:"5px 12px",fontWeight:500}}>{r.nome}</td>
-            <td style={{padding:"5px 12px"}}>{fmtDate(r.date)}</td>
-            <td style={{padding:"5px 12px",fontWeight:700}}>{fmtN(r.qty)}</td>
-            <td style={{padding:"5px 12px"}}>
-              <span style={{background:r.type==="entrada"?C.greenLight:r.type==="saldo"?C.blueLight:C.redAlertLight,color:r.type==="entrada"?C.green:r.type==="saldo"?C.blue:C.redAlert,padding:"1px 7px",borderRadius:20,fontSize:10,fontWeight:700}}>
-                {r.type==="entrada"?"↑ ENTRADA":r.type==="saldo"?"= SALDO":"↓ SAÍDA"}
-              </span>
-            </td>
-            <td style={{padding:"5px 12px"}}>{r.matched?<span style={{color:C.green,fontSize:10,fontWeight:700}}>✓ OK</span>:<span style={{color:C.yellow,fontSize:10,fontWeight:700}}>⚡ Novo</span>}</td>
-          </tr>)}</tbody>
-        </table></div>
-      </div>
-      <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-        <button style={btnS} onClick={()=>setStep("map")}>← Voltar</button>
-        <button style={{...btnP,opacity:loading?0.7:1}} onClick={doImport} disabled={loading}>{loading?"Importando...":"✓ Confirmar"}</button>
+
+      <div style={{marginTop:10,background:C.greenLight,borderRadius:10,padding:10,color:C.green,fontSize:12}}>
+        <b>✓ Dados Jan–Mai 2026 já carregados:</b> {initialProducts.length} produtos · {initialMovements.length} movimentos
+        · Consumo calculado: TotalSaídas MB5B ÷ {PERIODO_DIAS} dias
       </div>
     </div>}
 
-    {step==="done"&&result&&<div style={{textAlign:"center",padding:36}}>
-      <div style={{fontSize:52,marginBottom:12}}>✅</div>
-      <div style={{fontSize:20,fontWeight:800,marginBottom:4}}>Importação Concluída!</div>
-      <div style={{color:C.gray400,marginBottom:20,fontSize:12}}>{fileName}</div>
-      <div style={{display:"flex",gap:12,justifyContent:"center",marginBottom:24}}>
-        <div style={{background:C.greenLight,borderRadius:12,padding:"14px 24px"}}><div style={{fontSize:28,fontWeight:800,color:C.green}}>{result.added}</div><div style={{fontSize:11,color:C.green}}>movimentos</div></div>
-        {result.newProds>0&&<div style={{background:C.yellowLight,borderRadius:12,padding:"14px 24px"}}><div style={{fontSize:28,fontWeight:800,color:C.yellow}}>{result.newProds}</div><div style={{fontSize:11,color:C.yellow}}>novos produtos</div></div>}
+    {/* STEP 2 — Revisão */}
+    {step==="review"&&<div>
+      <div style={{display:"flex",gap:10,marginBottom:14}}>
+        {[
+          {v:files.length,l:"arquivos",bg:C.blueLight,c:C.blue},
+          {v:totalRecs,l:"registros encontrados",bg:C.greenLight,c:C.green},
+          {v:files.filter(f=>f.format==="MB5B").length,l:"MB5B (resumo)",bg:C.yellowLight,c:C.yellow},
+          {v:files.filter(f=>f.format==="MB51").length,l:"MB51 (movimentos)",bg:C.redAlertLight,c:C.redAlert},
+        ].map(k=><div key={k.l} style={{flex:1,background:k.bg,borderRadius:10,padding:12,textAlign:"center"}}>
+          <div style={{fontSize:26,fontWeight:800,color:k.c}}>{k.v}</div>
+          <div style={{fontSize:11,color:k.c}}>{k.l}</div>
+        </div>)}
       </div>
-      <button style={btnS} onClick={()=>{setStep("upload");setPreview([]);setRawRows([]);setFileName("");}}>+ Importar outro</button>
+
+      {files.map((f,fi)=><div key={fi} style={{background:C.white,border:`1px solid ${C.gray200}`,borderRadius:12,overflow:"hidden",marginBottom:10}}>
+        <div style={{padding:"10px 14px",background:C.gray50,borderBottom:`1px solid ${C.gray100}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontWeight:700,fontSize:13}}>📊 {f.name}</div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{background:C.blueLight,color:C.blue,padding:"2px 8px",borderRadius:20,fontSize:11,fontWeight:700}}>{f.format}</span>
+            <span style={{fontSize:12,color:C.gray400}}>{f.count} registros</span>
+          </div>
+        </div>
+        <div style={{maxHeight:180,overflowY:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead><tr style={{background:C.gray50}}>
+              {f.format==="MB5B"
+                ?["Material","Nome","Cons/dia","Saldo Final","Cobertura"].map(h=><th key={h} style={TH}>{h}</th>)
+                :["Data","Material","Nome","Tipo Mov","Quantidade","Dep"].map(h=><th key={h} style={TH}>{h}</th>)
+              }
+            </tr></thead>
+            <tbody>
+              {f.records.slice(0,50).map((r,ri)=>{
+                const prod=products.find(p=>p.codeSAP===r.mat);
+                return f.format==="MB5B"
+                  ?<tr key={ri} style={{borderBottom:`1px solid ${C.gray100}`}}>
+                    <td style={{padding:"5px 10px",fontFamily:"monospace"}}>{r.mat}</td>
+                    <td style={{padding:"5px 10px",fontWeight:500}}>{r.nome?.slice(0,28)}</td>
+                    <td style={{padding:"5px 10px",textAlign:"right",fontWeight:700}}>{N(r.consDia,2)} KG/d</td>
+                    <td style={{padding:"5px 10px",textAlign:"right"}}>{N(r.estFin)} KG</td>
+                    <td style={{padding:"5px 10px"}}>{r.consDia>0?<Badge days={Math.round(r.estFin/r.consDia)}/>:"—"}</td>
+                  </tr>
+                  :<tr key={ri} style={{borderBottom:`1px solid ${C.gray100}`,background:ri%2===0?C.white:C.gray50}}>
+                    <td style={{padding:"5px 10px"}}>{D(r.date)}</td>
+                    <td style={{padding:"5px 10px",fontFamily:"monospace"}}>{r.mat}</td>
+                    <td style={{padding:"5px 10px"}}>{(r.nome||prod?.name||"").slice(0,22)}</td>
+                    <td style={{padding:"5px 10px"}}>
+                      <span style={{background:["201","261"].includes(r.tmov)?C.redAlertLight:C.greenLight,
+                        color:["201","261"].includes(r.tmov)?C.redAlert:C.green,
+                        padding:"1px 6px",borderRadius:20,fontSize:10,fontWeight:700}}>{r.tmov}</span>
+                    </td>
+                    <td style={{padding:"5px 10px",fontWeight:700,textAlign:"right",
+                      color:r.qty<0?C.redAlert:C.green}}>{r.qty<0?"-":"+"}{N(Math.abs(r.qty))} KG</td>
+                    <td style={{padding:"5px 10px",color:C.gray400}}>{r.dep}</td>
+                  </tr>;
+              })}
+            </tbody>
+          </table>
+          {f.records.length>50&&<div style={{padding:"6px 12px",fontSize:11,color:C.gray400}}>+{f.records.length-50} registros...</div>}
+        </div>
+      </div>)}
+
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:4}}>
+        <button style={btnS} onClick={()=>{setStep("drop");setFiles([]);}}>← Voltar</button>
+        <button style={{...btnP,opacity:loading?0.7:1}} onClick={doImport} disabled={loading}>
+          {loading?"Importando...":"✓ Confirmar Importação"}
+        </button>
+      </div>
+    </div>}
+
+    {/* STEP 3 — Concluído */}
+    {step==="done"&&result&&<div style={{textAlign:"center",padding:40}}>
+      <div style={{fontSize:52,marginBottom:12}}>✅</div>
+      <div style={{fontSize:20,fontWeight:800,marginBottom:6}}>Importação Concluída!</div>
+      <div style={{color:C.gray400,fontSize:12,marginBottom:22}}>{result.files} arquivo(s) processados</div>
+      <div style={{display:"flex",gap:12,justifyContent:"center",marginBottom:28}}>
+        <div style={{background:C.blueLight,borderRadius:12,padding:"14px 22px"}}><div style={{fontSize:26,fontWeight:800,color:C.blue}}>{result.files}</div><div style={{fontSize:11,color:C.blue}}>arquivos</div></div>
+        <div style={{background:C.greenLight,borderRadius:12,padding:"14px 22px"}}><div style={{fontSize:26,fontWeight:800,color:C.green}}>{result.movs}</div><div style={{fontSize:11,color:C.green}}>movimentos</div></div>
+        {result.prods>0&&<div style={{background:C.yellowLight,borderRadius:12,padding:"14px 22px"}}><div style={{fontSize:26,fontWeight:800,color:C.yellow}}>{result.prods}</div><div style={{fontSize:11,color:C.yellow}}>novos produtos</div></div>}
+      </div>
+      <div style={{display:"flex",gap:8,justifyContent:"center"}}>
+        <button style={btnS} onClick={()=>{setStep("drop");setFiles([]);setResult(null);}}>+ Importar mais arquivos</button>
+      </div>
     </div>}
   </div>;
 }
 
-/* ══════════════════════════════════════════════════
-   APP PRINCIPAL
-══════════════════════════════════════════════════ */
+/* ═══════════════════════════ APP PRINCIPAL ═══════════════════════════ */
 export default function App(){
   const[tab,setTab]=useState("Dashboard");
   const[products,setProducts]=useState(initialProducts);
   const[movements,setMovements]=useState(initialMovements);
   const[showAddProd,setShowAddProd]=useState(false);
   const[showAddMov,setShowAddMov]=useState(false);
-  const[newProd,setNewProd]=useState({name:"",codeSAP:"",unit:"KG",type:"sólido",supplier:"",leadTime:15,criticality:"Média"});
-  const[newMov,setNewMov]=useState({pid:"",date:new Date().toISOString().slice(0,10),tipo:"201",qty:"",dep:"BQ3",obs:""});
-  const[logs,setLogs]=useState([{id:1,user:"sistema",action:"Dados SAP carregados — MB5B + MB51 · Jan–Mai 2026 · 14 produtos · 120 dias",date:"01/05/2026 00:00"}]);
+  const[detailProd,setDetailProd]=useState(null);
+  const[newProd,setNewProd]=useState({codeSAP:"",name:"",unit:"KG",type:"sólido",supplier:"",leadTime:15,criticality:"Média"});
+  const[newMov,setNewMov]=useState({pid:"",date:new Date().toISOString().slice(0,10),tmov:"201",qty:"",dep:"BQ3",obs:""});
   const[filterMov,setFilterMov]=useState("");
-  const[prodDetails,setProdDetails]=useState(null);
+  const[logs,setLogs]=useState([{id:1,user:"sistema",action:`Dados SAP carregados — MB5B + MB51 · ${initialProducts.length} produtos · ${PERIODO_DIAS} dias (01/01–01/05/2026)`,date:"01/05/2026 00:00"}]);
 
   const addLog=a=>setLogs(l=>[{id:Date.now(),user:"operador",action:a,date:new Date().toLocaleString("pt-BR")},...l]);
 
-  /* ══ ANALYTICS CORE ══
-     Fórmula principal (conforme especificado):
-     Consumo/dia = (EstIni + TotalEntradas - EstFin) / DiasDoPeríodo
-               = TotalSaidas / DiasDoPeríodo   ← equivalente quando dados MB5B são consistentes
-     
-     Para produtos com histórico importado, recalcula a partir dos movimentos acumulados.
-     Sempre usa o saldo SAP atual (estFin do produto) como estoque corrente.
+  /* ══ ANALYTICS — fórmula correta ══
+     Para cada produto:
+     • consDia  = p.totSai / PERIODO_DIAS  (fonte MB5B, mais confiável)
+     • estAtual = p.estFin  (saldo SAP em 01/05/2026)
+     • consumo mensal = MB51 real quando disponível, estimativa proporcional para os demais
+     • Após importações adicionais: reconsidera os novos movimentos
   */
-  const analytics = useMemo(()=>{
-    return products.map(p=>{
-      const movsProd = movements.filter(m=>m.pid===p.id).sort((a,b)=>a.date.localeCompare(b.date));
+  const analytics = useMemo(()=>products.map(p=>{
+    const movsProd = movements.filter(m=>m.pid===p.id).sort((a,b)=>a.date.localeCompare(b.date));
 
-      // ── Consumo calculado a partir dos movimentos (tipos 201 e 261) ──
-      const saidasMovs = movsProd.filter(m=>Number(m.qty)<0||(m.tipo==="201"||m.tipo==="261"));
-      const entradasMovs = movsProd.filter(m=>Number(m.qty)>0&&(m.tipo==="101"||m.tipo==="311"||m.tipo==="202"));
+    // Consumo base: usa consDia do produto (MB5B) se disponível
+    // Para produtos importados sem MB5B, calcula dos movimentos
+    let consDia = p.consDia||0;
+    let estAtual = p.estFin||0;
+    let totSai   = p.totSai||0;
+    let totEnt   = p.totEnt||0;
 
-      // Total saídas reais (consumo)
-      const totalSaidasMovs = saidasMovs.reduce((s,m)=>s+Math.abs(Number(m.qty)),0);
+    if(!p.consDia&&movsProd.length>0){
+      // Produto novo importado — calcula dos movimentos
+      const saidas = movsProd.filter(m=>["201","261"].includes(m.tmov)&&m.qty<0);
+      const ents   = movsProd.filter(m=>["101"].includes(m.tmov)&&m.qty>0);
+      totSai = saidas.reduce((s,m)=>s+Math.abs(m.qty),0);
+      totEnt = ents.reduce((s,m)=>s+m.qty,0);
+      const datas  = movsProd.map(m=>m.date).sort();
+      const d0=new Date(datas[0]||"2026-01-01"), d1=new Date("2026-05-01");
+      const dias   = Math.max(1,Math.round((d1-d0)/864e5));
+      consDia = totSai/dias;
+      estAtual= totEnt - totSai; // estimativa
+    }
 
-      // Período real coberto pelos movimentos
-      const datas = movsProd.map(m=>m.date).sort();
-      const dIni = datas[0] ? new Date(datas[0]) : new Date("2026-01-01");
-      const dFim = new Date("2026-05-01");
-      const diasMovs = Math.max(1, Math.round((dFim-dIni)/(1000*60*60*24)));
+    const consMes = consDia*30;
+    const cobertura = consDia>0?Math.round(estAtual/consDia):9999;
+    const estMin    = consDia*60;
+    const pontoPedido = consDia*p.leadTime;
+    const compra    = Math.max(0, consDia*(60+p.leadTime)-estAtual);
 
-      // Usar dados MB5B se produto original, ou movimentos se importado
-      const isOriginal = initialProducts.some(ip=>ip.id===p.id);
-      const totalSaidas = isOriginal ? p.totalSaidas : totalSaidasMovs;
-      const totalEntradas = isOriginal ? p.totalEntradas : entradasMovs.reduce((s,m)=>s+Math.abs(Number(m.qty)),0);
-      const dias = isOriginal ? PERIODO_DIAS : diasMovs;
+    // Consumo mensal
+    const byMonth = calcMensal(p.codeSAP, consDia);
 
-      // ══ FÓRMULA CENTRAL (como solicitado) ══
-      // Consumo = (EstIni + Entradas - EstFin) / Dias
-      // = TotalSaidas / Dias  (matematicamente equivalente pelo balanço de massa)
-      const consDia = totalSaidas > 0 ? totalSaidas / dias : 0;
-      const consSem = consDia * 7;
-      const consMes = consDia * 30;
+    return {...p,movsProd,consDia,consMes,estAtual,totSai,totEnt,cobertura,estMin,pontoPedido,compra,byMonth};
+  }),[products,movements]);
 
-      // Estoque atual (saldo SAP)
-      const estAtual = isOriginal ? p.estFin : Math.max(0, p.estFin + entradasMovs.reduce((s,m)=>s+m.qty,0) - totalSaidasMovs);
+  const sorted = useMemo(()=>[...analytics].sort((a,b)=>a.cobertura-b.cobertura),[analytics]);
 
-      // Cobertura: dias que o estoque atual vai durar
-      const cobertura = consDia > 0 ? Math.round(estAtual/consDia) : 9999;
-
-      // Estoque mínimo = consumo de 60 dias
-      const estMin = consDia * 60;
-
-      // Ponto de pedido = consumo durante lead time
-      const pontoPedido = consDia * p.leadTime;
-
-      // Compra sugerida = cobrir 60 dias + lead time, menos estoque atual
-      const compraSugerida = Math.max(0, consDia*(60+p.leadTime) - estAtual);
-
-      // Consumo por mês (dos movimentos)
-      const byMonth = {};
-      saidasMovs.forEach(m=>{
-        const mes=m.date.slice(0,7);
-        byMonth[mes]=(byMonth[mes]||0)+Math.abs(Number(m.qty));
-      });
-      // Para produtos originais, complementar com dados MB5B mensais estimados
-      if(isOriginal && Object.keys(byMonth).length === 0 && consDia > 0){
-        MESES.forEach(mes=>{byMonth[mes]=Math.round(consMes);});
-      }
-
-      return {
-        ...p, movsProd, totalSaidas, totalEntradas, dias,
-        consDia, consSem, consMes, estAtual, cobertura,
-        estMin, pontoPedido, compraSugerida, byMonth,
-      };
-    });
-  },[products,movements]);
+  const kpis = useMemo(()=>({
+    total:analytics.length,
+    crit:analytics.filter(p=>p.cobertura<30).length,
+    attn:analytics.filter(p=>p.cobertura>=30&&p.cobertura<60).length,
+    ok:analytics.filter(p=>p.cobertura>=60||p.cobertura===9999).length,
+    movs:movements.length,
+  }),[analytics,movements]);
 
   const alerts = useMemo(()=>{
     const a=[];
     analytics.forEach(p=>{
-      if(p.cobertura===0)a.push({sev:"critical",product:p.name,msg:"Estoque zerado — ruptura imediata",cod:p.codeSAP});
-      else if(p.cobertura<30)a.push({sev:"critical",product:p.name,msg:`Cobertura crítica: ${p.cobertura} dias (< 30)`,cod:p.codeSAP});
-      else if(p.cobertura<60)a.push({sev:"warning",product:p.name,msg:`Atenção: ${p.cobertura} dias de cobertura`,cod:p.codeSAP});
-      if(p.estAtual>0&&p.estAtual<p.pontoPedido)a.push({sev:"warning",product:p.name,msg:`Abaixo do ponto de pedido (${fmtN(p.pontoPedido)} KG)`,cod:p.codeSAP});
+      if(p.estAtual===0&&p.consDia>0) a.push({sev:"critical",product:p.name,cod:p.codeSAP,msg:"Estoque zerado — ruptura imediata"});
+      else if(p.cobertura<30&&p.cobertura!==9999) a.push({sev:"critical",product:p.name,cod:p.codeSAP,msg:`Cobertura crítica: ${p.cobertura} dias`});
+      else if(p.cobertura<60&&p.cobertura!==9999) a.push({sev:"warning",product:p.name,cod:p.codeSAP,msg:`Atenção: ${p.cobertura} dias de cobertura`});
+      if(p.estAtual>0&&p.estAtual<=p.pontoPedido&&p.pontoPedido>0) a.push({sev:"warning",product:p.name,cod:p.codeSAP,msg:`Abaixo do ponto de pedido (${N(p.pontoPedido,0)} KG)`});
     });
     return a.sort((a,b)=>(a.sev==="critical"?0:1)-(b.sev==="critical"?0:1));
   },[analytics]);
 
-  const kpis = useMemo(()=>({
-    total:analytics.length,
-    critical:analytics.filter(p=>p.cobertura<30).length,
-    attention:analytics.filter(p=>p.cobertura>=30&&p.cobertura<60).length,
-    ok:analytics.filter(p=>p.cobertura>=60).length,
-  }),[analytics]);
-
-  function handleImport(newMovs,newProds,fileName){
-    setMovements(m=>[...m,...newMovs]);
-    if(newProds.length>0)setProducts(p=>[...p,...newProds]);
-    addLog(`Importou ${newMovs.length} registros de ${fileName}${newProds.length>0?` · ${newProds.length} produtos novos`:""}`);
+  function handleImport(newMovs,newProds,fname){
+    if(newMovs.length) setMovements(m=>[...m,...newMovs]);
+    if(newProds.length) setProducts(p=>[...p,...newProds]);
+    addLog(`Importou ${newMovs.length} movimentos · ${newProds.length} novos produtos · Arquivo(s): ${fname}`);
   }
 
   function handleAddProd(e){
     e.preventDefault();
-    const p={...newProd,id:Date.now(),leadTime:Number(newProd.leadTime),estIni:0,totalEntradas:0,totalSaidas:0,estFin:0};
-    setProducts(pr=>[...pr,p]);addLog(`Cadastrou ${p.codeSAP} – ${p.name}`);
-    setNewProd({name:"",codeSAP:"",unit:"KG",type:"sólido",supplier:"",leadTime:15,criticality:"Média"});
+    const p={...newProd,id:Date.now(),leadTime:+newProd.leadTime,totEnt:0,totSai:0,estFin:0,consDia:0};
+    setProducts(pr=>[...pr,p]); addLog(`Cadastrou ${p.codeSAP} – ${p.name}`);
+    setNewProd({codeSAP:"",name:"",unit:"KG",type:"sólido",supplier:"",leadTime:15,criticality:"Média"});
     setShowAddProd(false);
   }
 
   function handleAddMov(e){
     e.preventDefault();
-    const isConsume=newMov.tipo==="201"||newMov.tipo==="261";
-    const m={...newMov,id:Date.now(),pid:Number(newMov.pid),qty:isConsume?-Math.abs(Number(newMov.qty)):Math.abs(Number(newMov.qty)),doc:"MANUAL"};
+    const isSaida=["201","261"].includes(newMov.tmov);
+    const m={...newMov,id:Date.now(),pid:+newMov.pid,qty:isSaida?-Math.abs(+newMov.qty):Math.abs(+newMov.qty),doc:"MANUAL"};
     setMovements(mv=>[...mv,m]);
     const pName=products.find(p=>p.id===m.pid)?.name??"";
-    addLog(`${isConsume?"Saída":"Entrada"} manual: ${fmtN(Math.abs(m.qty))} KG – ${pName} · Tipo ${m.tipo}`);
-    setNewMov({pid:"",date:new Date().toISOString().slice(0,10),tipo:"201",qty:"",dep:"BQ3",obs:""});
+    addLog(`${isSaida?"Saída":"Entrada"} manual (${m.tmov}): ${N(Math.abs(m.qty))} KG — ${pName}`);
+    setNewMov({pid:"",date:new Date().toISOString().slice(0,10),tmov:"201",qty:"",dep:"BQ3",obs:""});
     setShowAddMov(false);
   }
 
-  const filteredMovs=useMemo(()=>{
+  const filtMovs=useMemo(()=>{
     const mv=[...movements].sort((a,b)=>b.date.localeCompare(a.date));
-    if(!filterMov)return mv;
-    const pIds=products.filter(p=>p.name.toLowerCase().includes(filterMov.toLowerCase())||p.codeSAP.includes(filterMov)).map(p=>p.id);
-    return mv.filter(m=>pIds.includes(m.pid));
+    if(!filterMov) return mv;
+    const ids=products.filter(p=>p.name.toLowerCase().includes(filterMov.toLowerCase())||p.codeSAP.includes(filterMov)).map(p=>p.id);
+    return mv.filter(m=>ids.includes(m.pid));
   },[movements,products,filterMov]);
 
-  const maxStock=Math.max(...analytics.map(x=>x.estAtual),1);
-  const maxSaidas=Math.max(...analytics.map(x=>x.totalSaidas),1);
-  const maxConsDia=Math.max(...analytics.map(x=>x.consDia),1);
+  const maxEst = Math.max(...analytics.map(p=>p.estAtual),1);
+  const maxSai = Math.max(...analytics.map(p=>p.totSai),1);
 
-  return<div style={{minHeight:"100vh",background:C.gray50,fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif",color:C.gray900}}>
+  const cobColor = d => d<30?C.redAlert:d<60?C.yellow:C.green;
+
+  return <div style={{minHeight:"100vh",background:C.gray50,fontFamily:"'IBM Plex Sans','Helvetica Neue',Arial,sans-serif",color:C.gray900}}>
 
     {/* HEADER */}
-    <header style={{background:C.red,color:C.white,padding:"0 22px",display:"flex",alignItems:"center",gap:12,height:58,boxShadow:"0 2px 16px rgba(200,16,46,0.22)",position:"sticky",top:0,zIndex:100}}>
-      <div style={{display:"flex",alignItems:"center",gap:9}}>
-        <div style={{width:33,height:33,background:"rgba(255,255,255,0.15)",borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:900}}>⬡</div>
+    <header style={{background:C.red,color:C.white,padding:"0 20px",display:"flex",alignItems:"center",gap:12,height:56,boxShadow:"0 2px 16px rgba(200,16,46,0.22)",position:"sticky",top:0,zIndex:100}}>
+      <div style={{display:"flex",alignItems:"center",gap:9,minWidth:170}}>
+        <div style={{width:32,height:32,background:"rgba(255,255,255,0.15)",borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:900}}>⬡</div>
         <div>
-          <div style={{fontWeight:800,fontSize:14,letterSpacing:0.5}}>CHEMTRACK</div>
-          <div style={{fontSize:9,opacity:0.72,letterSpacing:1.4,textTransform:"uppercase"}}>Refinaria de Manaus · C201</div>
+          <div style={{fontWeight:800,fontSize:14}}>CHEMTRACK</div>
+          <div style={{fontSize:9,opacity:.7,letterSpacing:1.4,textTransform:"uppercase"}}>Refinaria de Manaus · C201</div>
         </div>
       </div>
       <div style={{flex:1}}/>
       <nav style={{display:"flex",gap:2}}>
-        {TABS.map(t=><button key={t} onClick={()=>setTab(t)} style={{background:tab===t?"rgba(255,255,255,0.18)":"transparent",color:C.white,border:tab===t?"1.5px solid rgba(255,255,255,0.3)":"1.5px solid transparent",borderRadius:7,padding:"5px 11px",fontWeight:tab===t?700:500,fontSize:11,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+        {TABS.map(t=><button key={t} onClick={()=>setTab(t)} style={{
+          background:tab===t?"rgba(255,255,255,0.18)":"transparent",
+          color:C.white,border:tab===t?"1.5px solid rgba(255,255,255,0.3)":"1.5px solid transparent",
+          borderRadius:7,padding:"5px 10px",fontWeight:tab===t?700:500,fontSize:11,
+          cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>
           {t==="Importar SAP"?"📊 "+t:t}
         </button>)}
       </nav>
-      {alerts.filter(a=>a.sev==="critical").length>0&&<div style={{background:"rgba(0,0,0,0.18)",borderRadius:7,padding:"4px 10px",fontSize:11,whiteSpace:"nowrap"}}>
-        <span style={{background:C.white,color:C.red,borderRadius:20,padding:"1px 7px",fontWeight:800,marginRight:5}}>{alerts.filter(a=>a.sev==="critical").length}</span>críticos
-      </div>}
+      {alerts.filter(a=>a.sev==="critical").length>0&&
+        <div onClick={()=>setTab("Alertas")} style={{background:"rgba(0,0,0,0.2)",borderRadius:7,padding:"4px 10px",fontSize:11,cursor:"pointer",whiteSpace:"nowrap"}}>
+          <span style={{background:C.white,color:C.red,borderRadius:20,padding:"1px 7px",fontWeight:800,marginRight:5}}>{alerts.filter(a=>a.sev==="critical").length}</span>críticos
+        </div>}
     </header>
 
-    <main style={{maxWidth:1380,margin:"0 auto",padding:"20px 16px"}}>
+    <main style={{maxWidth:1400,margin:"0 auto",padding:"18px 14px"}}>
 
       {/* ══ DASHBOARD ══ */}
       {tab==="Dashboard"&&<div>
-        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:18}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16}}>
           <div>
             <div style={{fontSize:20,fontWeight:800}}>Dashboard Gerencial</div>
-            <div style={{fontSize:11,color:C.gray400,marginTop:2}}>Centro C201 · Refinaria de Manaus S.A. · Posição SAP: 01/05/2026</div>
-            <div style={{fontSize:11,color:C.blue,marginTop:3,background:C.blueLight,display:"inline-block",padding:"2px 10px",borderRadius:20}}>
-              ⓘ Consumo médio = Total Saídas SAP ÷ {PERIODO_DIAS} dias (01/01–01/05/2026)
+            <div style={{fontSize:11,color:C.gray400,marginTop:2}}>Centro C201 · Posição SAP: 01/05/2026 · Período base: {PERIODO_DIAS} dias</div>
+            <div style={{fontSize:11,color:C.blue,marginTop:4,background:C.blueLight,display:"inline-block",padding:"2px 10px",borderRadius:20,fontWeight:600}}>
+              Consumo/dia = Saídas SAP (tipos 201+261) ÷ {PERIODO_DIAS} dias · Cobertura = Saldo ÷ Consumo/dia
             </div>
           </div>
-          <div style={{display:"flex",gap:7}}>
+          <div style={{display:"flex",gap:7,flexShrink:0}}>
             <button onClick={()=>setTab("Importar SAP")} style={{...btnP,fontSize:12}}>📊 Importar SAP</button>
             <button onClick={()=>setShowAddMov(true)} style={{...btnS,fontSize:12}}>+ Lançamento</button>
           </div>
         </div>
 
         {/* KPIs */}
-        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:11,marginBottom:16}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:14}}>
           {[
-            {label:"Total Produtos",value:kpis.total,sub:`${movements.length} movimentos`,color:C.red,icon:"⬡"},
-            {label:"Crítico",value:kpis.critical,sub:"cobertura < 30 dias",color:"#B91C1C",icon:"✕"},
-            {label:"Atenção",value:kpis.attention,sub:"cobertura 30–59 dias",color:C.yellow,icon:"◐"},
-            {label:"Adequado",value:kpis.ok,sub:"cobertura ≥ 60 dias",color:C.green,icon:"●"},
-          ].map(k=><div key={k.label} style={{background:C.white,borderRadius:12,padding:15,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",borderTop:`3px solid ${k.color}`}}>
+            {l:"Total Produtos",v:kpis.total,sub:`${kpis.movs} movimentos`,c:C.red,ic:"⬡"},
+            {l:"Crítico",v:kpis.crit,sub:"cobertura < 30d",c:"#B91C1C",ic:"✕"},
+            {l:"Atenção",v:kpis.attn,sub:"cobertura 30–59d",c:C.yellow,ic:"◐"},
+            {l:"Adequado",v:kpis.ok,sub:"cobertura ≥ 60d",c:C.green,ic:"●"},
+            {l:"Alertas Ativos",v:alerts.length,sub:`${alerts.filter(a=>a.sev==="critical").length} críticos`,c:alerts.length>0?C.red:C.green,ic:"⚠"},
+          ].map(k=><div key={k.l} style={{background:C.white,borderRadius:12,padding:14,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",borderTop:`3px solid ${k.c}`,cursor:"pointer"}}
+            onClick={()=>k.l==="Alertas Ativos"&&setTab("Alertas")}>
             <div style={{display:"flex",justifyContent:"space-between"}}>
-              <div style={{fontSize:10,color:C.gray400,fontWeight:700,letterSpacing:0.5,textTransform:"uppercase"}}>{k.label}</div>
-              <div style={{color:k.color,fontSize:14}}>{k.icon}</div>
+              <div style={{fontSize:10,color:C.gray400,fontWeight:700,letterSpacing:.5,textTransform:"uppercase"}}>{k.l}</div>
+              <div style={{color:k.c,fontSize:13}}>{k.ic}</div>
             </div>
-            <div style={{fontSize:32,fontWeight:800,color:k.color,lineHeight:1,margin:"6px 0 3px"}}>{k.value}</div>
+            <div style={{fontSize:30,fontWeight:800,color:k.c,lineHeight:1,margin:"6px 0 3px"}}>{k.v}</div>
             <div style={{fontSize:10,color:C.gray400}}>{k.sub}</div>
           </div>)}
         </div>
 
-        {/* Tabela principal de status */}
+        {/* Tabela de status */}
         <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden",marginBottom:14}}>
-          <div style={{padding:"12px 18px",borderBottom:`1px solid ${C.gray100}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${C.gray100}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
-              <div style={{fontWeight:700,fontSize:14}}>Posição de Estoque — Saldo SAP</div>
-              <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Fórmula: Consumo/dia = Saídas SAP (201+261) ÷ {PERIODO_DIAS} dias · Cobertura = Saldo ÷ Consumo/dia</div>
+              <div style={{fontWeight:700,fontSize:14}}>Posição de Estoque — Saldo SAP · Ordenado por cobertura (menor → maior)</div>
+              <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Clique em um produto para ver detalhes dos movimentos</div>
             </div>
-            <div style={{fontSize:10,color:C.gray400}}>01/05/2026</div>
+            <div style={{fontSize:10,color:C.gray400,whiteSpace:"nowrap"}}>01/05/2026</div>
           </div>
           <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr style={{background:C.gray50}}>
-              {["Produto","SAP","Tipo de Mov.","Saldo SAP (KG)","Cons./dia","Cons./mês","Cobertura","Est. Mínimo (60d)","P. Pedido (LT)","Compra Sugerida","Status"].map(h=><th key={h} style={TH}>{h}</th>)}
+              {["Produto","SAP","Saldo SAP","Cons./dia","Cons./mês","Cobertura","Est. Mín. 60d","P. Pedido (LT)","Compra Sugerida","Status"].map(h=><th key={h} style={TH}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {[...analytics].sort((a,b)=>a.cobertura-b.cobertura).map((p,i)=>{
-                const cobStr=p.cobertura===9999?"∞":`${p.cobertura}d`;
-                const cobColor=p.cobertura<30?C.redAlert:p.cobertura<60?C.yellow:C.green;
-                return<tr key={p.id} onClick={()=>setProdDetails(p)} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50,cursor:"pointer"}}
+              {sorted.map((p,i)=>{
+                const cc=cobColor(p.cobertura);
+                return <tr key={p.id} onClick={()=>setDetailProd(p)}
+                  style={{borderBottom:`1px solid ${C.gray100}`,cursor:"pointer",
+                    background:i%2===0?C.white:C.gray50}}
                   onMouseEnter={e=>e.currentTarget.style.background=C.redLight}
                   onMouseLeave={e=>e.currentTarget.style.background=i%2===0?C.white:C.gray50}>
-                  <td style={{padding:"10px 14px"}}>
+                  <td style={{padding:"9px 14px"}}>
                     <div style={{fontWeight:600,fontSize:12}}>{p.name}</div>
-                    <div style={{fontSize:10,color:C.gray400,marginTop:1}}>{p.type} · <CritBadge level={p.criticality}/></div>
+                    <div style={{fontSize:10,color:C.gray400,marginTop:1}}>{p.type} · <Crit v={p.criticality}/></div>
                   </td>
-                  <td style={{padding:"10px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{p.codeSAP}</td>
-                  <td style={{padding:"10px 14px",fontSize:10,color:C.gray500}}>
-                    <div>Saídas: 201/261</div>
-                    <div>Entradas: 101</div>
+                  <td style={{padding:"9px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{p.codeSAP}</td>
+                  <td style={{padding:"9px 14px",minWidth:130}}>
+                    <div style={{fontWeight:700,fontSize:12,marginBottom:3}}>{N(p.estAtual)} KG</div>
+                    <Bar v={p.estAtual} max={maxEst} color={cc}/>
                   </td>
-                  <td style={{padding:"10px 14px",minWidth:130}}>
-                    <div style={{fontWeight:700,fontSize:12,marginBottom:3}}>{fmtN(p.estAtual)} KG</div>
-                    <Bar value={p.estAtual} max={maxStock} color={cobColor}/>
+                  <td style={{padding:"9px 14px",fontSize:12,fontWeight:600}}>{N(p.consDia,2)} KG</td>
+                  <td style={{padding:"9px 14px",fontSize:11,color:C.gray600}}>{N(p.consMes,0)} KG</td>
+                  <td style={{padding:"9px 14px"}}>
+                    <div style={{fontWeight:800,fontSize:13,color:cc}}>{p.cobertura===9999?"∞":`${p.cobertura}d`}</div>
+                    <Bar v={Math.min(p.cobertura===9999?120:p.cobertura,120)} max={120} color={cc} h={4}/>
                   </td>
-                  <td style={{padding:"10px 14px",fontSize:12,fontWeight:600,color:C.gray800}}>{fmtN(p.consDia,2)} KG</td>
-                  <td style={{padding:"10px 14px",fontSize:12,color:C.gray600}}>{fmtN(p.consMes,0)} KG</td>
-                  <td style={{padding:"10px 14px"}}>
-                    <div style={{fontWeight:800,fontSize:13,color:cobColor}}>{cobStr}</div>
-                    <Bar value={Math.min(p.cobertura,120)} max={120} color={cobColor} h={4}/>
+                  <td style={{padding:"9px 14px",fontSize:11,color:C.gray600}}>{N(p.estMin,0)} KG</td>
+                  <td style={{padding:"9px 14px",fontSize:11,color:C.gray600}}>{N(p.pontoPedido,0)} KG <span style={{fontSize:9,color:C.gray400}}>LT:{p.leadTime}d</span></td>
+                  <td style={{padding:"9px 14px",fontWeight:700,fontSize:12,color:p.compra>0?C.redAlert:C.gray300}}>
+                    {p.compra>0?`${N(p.compra,0)} KG`:"—"}
                   </td>
-                  <td style={{padding:"10px 14px",fontSize:11,color:C.gray600}}>{fmtN(p.estMin,0)} KG</td>
-                  <td style={{padding:"10px 14px",fontSize:11,color:C.gray600}}>{fmtN(p.pontoPedido,0)} KG <span style={{fontSize:9,color:C.gray400}}>LT:{p.leadTime}d</span></td>
-                  <td style={{padding:"10px 14px",fontSize:12,fontWeight:700,color:p.compraSugerida>0?C.red:C.gray300}}>
-                    {p.compraSugerida>0?`${fmtN(p.compraSugerida,0)} KG`:"—"}
-                  </td>
-                  <td style={{padding:"10px 14px"}}><StatusBadge days={p.cobertura}/></td>
+                  <td style={{padding:"9px 14px"}}><Badge days={p.cobertura}/></td>
                 </tr>;
               })}
             </tbody>
           </table>
           </div>
-          <div style={{padding:"8px 18px",fontSize:10,color:C.gray400,borderTop:`1px solid ${C.gray100}`,background:C.gray50}}>
-            💡 Clique em qualquer produto para ver o detalhe de movimentos
-          </div>
         </div>
 
-        {/* Histórico de consumo mensal */}
+        {/* Consumo mensal */}
         <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden"}}>
-          <div style={{padding:"12px 18px",borderBottom:`1px solid ${C.gray100}`}}>
-            <div style={{fontWeight:700,fontSize:14}}>Histórico de Consumo Mensal por Produto</div>
-            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Saídas SAP tipos 201+261 · Depósito BQ3 · Jan a Mai 2026</div>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${C.gray100}`}}>
+            <div style={{fontWeight:700,fontSize:14}}>Consumo Mensal por Produto — Jan a Mai 2026</div>
+            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>
+              Valores reais MB51 (tipos 201+261) · (*) estimativa proporcional para produtos sem detalhe mensal
+            </div>
           </div>
           <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr style={{background:C.gray50}}>
               <th style={TH}>Produto</th>
-              {MESES.map(m=><th key={m} style={{...TH,textAlign:"right"}}>{MESES_LABEL[m]}</th>)}
-              <th style={{...TH,textAlign:"right"}}>TOTAL SAP</th>
+              {MESES.map(m=><th key={m} style={{...TH,textAlign:"right"}}>{m.replace("2026-","")}/26</th>)}
+              <th style={{...TH,textAlign:"right"}}>TOTAL MB5B</th>
               <th style={{...TH,textAlign:"right"}}>Média/mês</th>
+              <th style={{...TH,textAlign:"right"}}>Cons./dia</th>
             </tr></thead>
             <tbody>
-              {[...analytics].sort((a,b)=>b.totalSaidas-a.totalSaidas).map((p,i)=>{
-                const mesAvg=p.totalSaidas>0?p.totalSaidas/(PERIODO_DIAS/30):0;
-                return<tr key={p.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-                  <td style={{padding:"9px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{p.name}</td>
+              {[...analytics].sort((a,b)=>b.totSai-a.totSai).map((p,i)=>{
+                const hasMB51=!!MB51_MENSAL[p.codeSAP];
+                return <tr key={p.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
+                  <td style={{padding:"8px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>
+                    {p.name} {!hasMB51&&<span style={{fontSize:9,color:C.gray400,fontWeight:400}}>(*)</span>}
+                  </td>
                   {MESES.map(m=>{
                     const v=p.byMonth[m]||0;
-                    return<td key={m} style={{padding:"9px 14px",textAlign:"right",fontSize:11,fontWeight:v?600:400,color:v?C.gray900:C.gray300}}>
-                      {v?fmtN(v):"—"}
+                    const isReal=hasMB51&&MB51_MENSAL[p.codeSAP]?.[m]!==undefined;
+                    return <td key={m} style={{padding:"8px 14px",textAlign:"right",fontSize:11,
+                      fontWeight:v&&isReal?700:v?500:400,
+                      color:v&&isReal?C.gray900:v?C.gray600:C.gray300}}>
+                      {v?N(v,0):"—"}
                     </td>;
                   })}
-                  <td style={{padding:"9px 14px",textAlign:"right",fontWeight:800,fontSize:11,color:p.totalSaidas?C.red:C.gray300}}>{p.totalSaidas?fmtN(p.totalSaidas):"—"}</td>
-                  <td style={{padding:"9px 14px",textAlign:"right",fontSize:11,color:C.gray600}}>{mesAvg>0?fmtN(mesAvg,0)+" KG":"—"}</td>
+                  <td style={{padding:"8px 14px",textAlign:"right",fontWeight:800,fontSize:11,color:p.totSai?C.red:C.gray300}}>{p.totSai?N(p.totSai,0):"—"}</td>
+                  <td style={{padding:"8px 14px",textAlign:"right",fontSize:11,color:C.gray600}}>{N(p.consMes,0)}</td>
+                  <td style={{padding:"8px 14px",textAlign:"right",fontSize:11,fontWeight:700,color:C.red}}>{N(p.consDia,2)}</td>
                 </tr>;
               })}
             </tbody>
@@ -748,37 +816,49 @@ export default function App(){
         </div>
       </div>}
 
-      {/* ══ DETALHE PRODUTO (modal) ══ */}
-      {prodDetails&&<Modal title={`Detalhe: ${prodDetails.name}`} onClose={()=>setProdDetails(null)} width={680}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+      {/* Modal detalhe produto */}
+      {detailProd&&<Modal title={detailProd.name} onClose={()=>setDetailProd(null)} w={700}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:14}}>
           {[
-            {l:"Saldo SAP",v:`${fmtN(prodDetails.estAtual)} KG`,c:C.red},
-            {l:"Cons./dia (média)",v:`${fmtN(prodDetails.consDia,2)} KG`,c:C.gray900},
-            {l:"Cobertura",v:prodDetails.cobertura===9999?"∞":`${prodDetails.cobertura} dias`,c:prodDetails.cobertura<30?C.redAlert:prodDetails.cobertura<60?C.yellow:C.green},
-            {l:"Total Entradas",v:`${fmtN(prodDetails.totalEntradas)} KG`,c:C.green},
-            {l:"Total Saídas SAP",v:`${fmtN(prodDetails.totalSaidas)} KG`,c:C.red},
-            {l:"Compra Sugerida",v:prodDetails.compraSugerida>0?`${fmtN(prodDetails.compraSugerida,0)} KG`:"—",c:prodDetails.compraSugerida>0?C.red:C.green},
+            {l:"Saldo SAP",v:`${N(detailProd.estAtual)} KG`,c:C.red},
+            {l:"Cons./dia (MB5B÷120d)",v:`${N(detailProd.consDia,2)} KG/d`,c:C.gray900},
+            {l:"Cobertura",v:detailProd.cobertura===9999?"∞":`${detailProd.cobertura} dias`,c:cobColor(detailProd.cobertura)},
+            {l:"Total Entradas",v:`${N(detailProd.totEnt,0)} KG`,c:C.green},
+            {l:"Total Saídas SAP",v:`${N(detailProd.totSai,0)} KG`,c:C.redAlert},
+            {l:"Compra Sugerida",v:detailProd.compra>0?`${N(detailProd.compra,0)} KG`:"—",c:detailProd.compra>0?C.red:C.green},
           ].map(k=><div key={k.l} style={{background:C.gray50,borderRadius:8,padding:10,textAlign:"center"}}>
             <div style={{fontSize:10,color:C.gray400,fontWeight:600,marginBottom:3}}>{k.l}</div>
-            <div style={{fontSize:16,fontWeight:800,color:k.c}}>{k.v}</div>
+            <div style={{fontSize:15,fontWeight:800,color:k.c}}>{k.v}</div>
           </div>)}
         </div>
-        <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:C.gray800}}>Movimentos Registrados</div>
+        <div style={{fontSize:12,fontWeight:700,color:C.gray800,marginBottom:8}}>
+          Movimentos ({detailProd.movsProd.length})
+          <span style={{fontSize:10,color:C.gray400,fontWeight:400,marginLeft:8}}>
+            Tipos 201/261 = saída · 101 = entrada compra
+          </span>
+        </div>
+        {detailProd.movsProd.length===0&&<div style={{padding:20,textAlign:"center",color:C.gray400,fontSize:13}}>
+          Produto sem movimentos detalhados no MB51 · Consumo calculado pelo MB5B ({N(detailProd.consDia,2)} KG/dia × 120 dias = {N(detailProd.totSai,0)} KG)
+        </div>}
         <div style={{maxHeight:260,overflowY:"auto",border:`1px solid ${C.gray200}`,borderRadius:8}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
             <thead><tr style={{background:C.gray50}}>
-              {["Data","Tipo Mov.","Qtd KG","Dep.","Documento","Observação"].map(h=><th key={h} style={TH}>{h}</th>)}
+              {["Data","Tipo","Qtd KG","Dep.","Doc. Material","Observação"].map(h=><th key={h} style={TH}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {prodDetails.movsProd.sort((a,b)=>b.date.localeCompare(a.date)).map((m,i)=>{
-                const isSaida=Number(m.qty)<0||m.tipo==="201"||m.tipo==="261";
-                return<tr key={m.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-                  <td style={{padding:"5px 10px"}}>{fmtDate(m.date)}</td>
-                  <td style={{padding:"5px 10px"}}><span style={{background:isSaida?C.redAlertLight:C.greenLight,color:isSaida?C.redAlert:C.green,padding:"1px 6px",borderRadius:20,fontSize:10,fontWeight:700}}>{m.tipo||"—"}</span></td>
-                  <td style={{padding:"5px 10px",fontWeight:700,color:isSaida?C.redAlert:C.green}}>{isSaida?"-":"+"}  {fmtN(Math.abs(Number(m.qty)))}</td>
+              {[...detailProd.movsProd].sort((a,b)=>b.date.localeCompare(a.date)).map((m,i)=>{
+                const isSaida=m.qty<0||["201","261"].includes(m.tmov);
+                return <tr key={m.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
+                  <td style={{padding:"5px 10px",whiteSpace:"nowrap"}}>{D(m.date)}</td>
+                  <td style={{padding:"5px 10px"}}>
+                    <span style={{background:isSaida?C.redAlertLight:C.greenLight,color:isSaida?C.redAlert:C.green,padding:"1px 6px",borderRadius:20,fontSize:10,fontWeight:700}}>{m.tmov}</span>
+                  </td>
+                  <td style={{padding:"5px 10px",fontWeight:700,color:isSaida?C.redAlert:C.green,textAlign:"right"}}>
+                    {isSaida?"-":"+"}{N(Math.abs(m.qty))}
+                  </td>
                   <td style={{padding:"5px 10px",color:C.gray400}}>{m.dep}</td>
                   <td style={{padding:"5px 10px",fontFamily:"monospace",color:C.gray400,fontSize:10}}>{m.doc}</td>
-                  <td style={{padding:"5px 10px",color:C.gray500}}>{m.obs}</td>
+                  <td style={{padding:"5px 10px",color:C.gray500}}>{m.obs||"—"}</td>
                 </tr>;
               })}
             </tbody>
@@ -788,63 +868,67 @@ export default function App(){
 
       {/* ══ PRODUTOS ══ */}
       {tab==="Produtos"&&<div>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
-          <div><div style={{fontSize:20,fontWeight:800}}>Cadastro de Produtos</div><div style={{fontSize:11,color:C.gray400,marginTop:2}}>{products.length} produtos</div></div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+          <div><div style={{fontSize:20,fontWeight:800}}>Cadastro de Produtos</div><div style={{fontSize:11,color:C.gray400}}>{products.length} produtos</div></div>
           <button onClick={()=>setShowAddProd(true)} style={btnP}>+ Novo Produto</button>
         </div>
         {showAddProd&&<Modal title="Novo Produto Químico" onClose={()=>setShowAddProd(false)}>
           <form onSubmit={handleAddProd}>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              {[{l:"Nome do Produto",f:"name",full:true},{l:"Código SAP",f:"codeSAP"},{l:"Fornecedor",f:"supplier"},{l:"Lead Time (dias)",f:"leadTime",t:"number"}].map(({l,f,full,t})=><div key={f} style={{gridColumn:full?"1/-1":"auto"}}>
+              {[{l:"Código SAP",f:"codeSAP"},{l:"Nome do Produto",f:"name",full:true},{l:"Fornecedor",f:"supplier"},{l:"Lead Time (dias)",f:"leadTime",t:"number"}].map(({l,f,full,t})=><div key={f} style={{gridColumn:full?"1/-1":"auto"}}>
                 <label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>{l}</label>
-                <input style={inp} type={t||"text"} value={newProd[f]} required onChange={e=>setNewProd(p=>({...p,[f]:e.target.value}))}/>
+                <input style={inp} type={t||"text"} value={newProd[f]} required={f!=="supplier"} onChange={e=>setNewProd(p=>({...p,[f]:e.target.value}))}/>
               </div>)}
               {[{l:"Unidade",f:"unit",opts:["KG","L","m³","t"]},{l:"Tipo",f:"type",opts:["sólido","líquido","gasoso"]},{l:"Criticidade",f:"criticality",opts:["Alta","Média","Baixa"]}].map(({l,f,opts})=><div key={f}>
                 <label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>{l}</label>
                 <select style={inp} value={newProd[f]} onChange={e=>setNewProd(p=>({...p,[f]:e.target.value}))}>{opts.map(o=><option key={o}>{o}</option>)}</select>
               </div>)}
             </div>
-            <div style={{display:"flex",gap:8,marginTop:18,justifyContent:"flex-end"}}>
+            <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
               <button type="button" style={btnS} onClick={()=>setShowAddProd(false)}>Cancelar</button>
               <button type="submit" style={btnP}>Salvar</button>
             </div>
           </form>
         </Modal>}
         <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden"}}>
-          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}>
+          <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr style={{background:C.gray50}}>
-              {["Produto","Código SAP","Un.","Tipo","Fornecedor","LT","Saldo SAP","Cons./dia","Cob.","Est. Mínimo","P. Pedido","Criticidade"].map(h=><th key={h} style={TH}>{h}</th>)}
+              {["Produto","Cód. SAP","Un","Tipo","Fornecedor","LT","Saldo SAP","Cons./dia","Cobertura","Est. Mín.","P. Pedido","Criticidade"].map(h=><th key={h} style={TH}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {analytics.map((p,i)=><tr key={p.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-                <td style={{padding:"10px 14px",fontWeight:600,fontSize:12,whiteSpace:"nowrap"}}>{p.name}</td>
-                <td style={{padding:"10px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{p.codeSAP}</td>
-                <td style={{padding:"10px 14px",fontSize:11}}>{p.unit}</td>
-                <td style={{padding:"10px 14px",fontSize:11,textTransform:"capitalize"}}>{p.type}</td>
-                <td style={{padding:"10px 14px",fontSize:11,color:C.gray500,whiteSpace:"nowrap"}}>{p.supplier||"—"}</td>
-                <td style={{padding:"10px 14px",fontSize:11}}>{p.leadTime}d</td>
-                <td style={{padding:"10px 14px",fontWeight:700,fontSize:12}}>{fmtN(p.estAtual)} KG</td>
-                <td style={{padding:"10px 14px",fontSize:11,fontWeight:600}}>{fmtN(p.consDia,2)} KG/d</td>
-                <td style={{padding:"10px 14px"}}><StatusBadge days={p.cobertura}/></td>
-                <td style={{padding:"10px 14px",fontSize:11,color:C.gray500}}>{fmtN(p.estMin,0)} KG</td>
-                <td style={{padding:"10px 14px",fontSize:11,color:C.gray500}}>{fmtN(p.pontoPedido,0)} KG</td>
-                <td style={{padding:"10px 14px"}}><CritBadge level={p.criticality}/></td>
+              {analytics.map((p,i)=><tr key={p.id} onClick={()=>setDetailProd(p)} style={{borderBottom:`1px solid ${C.gray100}`,cursor:"pointer",background:i%2===0?C.white:C.gray50}}
+                onMouseEnter={e=>e.currentTarget.style.background=C.redLight}
+                onMouseLeave={e=>e.currentTarget.style.background=i%2===0?C.white:C.gray50}>
+                <td style={{padding:"9px 14px",fontWeight:600,fontSize:12,whiteSpace:"nowrap"}}>{p.name}</td>
+                <td style={{padding:"9px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{p.codeSAP}</td>
+                <td style={{padding:"9px 14px",fontSize:11}}>{p.unit}</td>
+                <td style={{padding:"9px 14px",fontSize:11,textTransform:"capitalize"}}>{p.type}</td>
+                <td style={{padding:"9px 14px",fontSize:11,color:C.gray500}}>{p.supplier||"—"}</td>
+                <td style={{padding:"9px 14px",fontSize:11}}>{p.leadTime}d</td>
+                <td style={{padding:"9px 14px",fontWeight:700,fontSize:12}}>{N(p.estAtual)} KG</td>
+                <td style={{padding:"9px 14px",fontSize:11,fontWeight:600}}>{N(p.consDia,2)} KG/d</td>
+                <td style={{padding:"9px 14px"}}><Badge days={p.cobertura}/></td>
+                <td style={{padding:"9px 14px",fontSize:11,color:C.gray500}}>{N(p.estMin,0)} KG</td>
+                <td style={{padding:"9px 14px",fontSize:11,color:C.gray500}}>{N(p.pontoPedido,0)} KG</td>
+                <td style={{padding:"9px 14px"}}><Crit v={p.criticality}/></td>
               </tr>)}
             </tbody>
-          </table></div>
+          </table>
+          </div>
         </div>
       </div>}
 
       {/* ══ MOVIMENTOS ══ */}
       {tab==="Movimentos"&&<div>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
-          <div><div style={{fontSize:20,fontWeight:800}}>Movimentos de Estoque</div><div style={{fontSize:11,color:C.gray400,marginTop:2}}>{movements.length} registros · MB51 SAP + Manuais</div></div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+          <div><div style={{fontSize:20,fontWeight:800}}>Movimentos de Estoque</div><div style={{fontSize:11,color:C.gray400}}>{movements.length} registros · MB51 SAP + Manuais</div></div>
           <div style={{display:"flex",gap:7}}>
-            <input style={{...inp,width:220}} placeholder="Filtrar produto ou código..." value={filterMov} onChange={e=>setFilterMov(e.target.value)}/>
+            <input style={{...inp,width:220}} placeholder="Filtrar por produto ou código..." value={filterMov} onChange={e=>setFilterMov(e.target.value)}/>
             <button onClick={()=>setShowAddMov(true)} style={btnP}>+ Lançamento Manual</button>
           </div>
         </div>
-        {showAddMov&&<Modal title="Lançamento Manual de Movimento" onClose={()=>setShowAddMov(false)} width={480}>
+        {showAddMov&&<Modal title="Lançamento Manual" onClose={()=>setShowAddMov(false)} w={480}>
           <form onSubmit={handleAddMov}>
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
               <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Produto</label>
@@ -855,11 +939,11 @@ export default function App(){
               </div>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
                 <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Tipo de Movimento SAP</label>
-                  <select style={inp} value={newMov.tipo} onChange={e=>setNewMov(m=>({...m,tipo:e.target.value}))}>
-                    <option value="201">201 – Saída consumo (centro custo)</option>
+                  <select style={inp} value={newMov.tmov} onChange={e=>setNewMov(m=>({...m,tmov:e.target.value}))}>
+                    <option value="201">201 – Saída centro de custo</option>
                     <option value="261">261 – Saída para ordem</option>
                     <option value="101">101 – Entrada por compra (NF)</option>
-                    <option value="202">202 – Devolução de consumo</option>
+                    <option value="202">202 – Devolução</option>
                   </select>
                 </div>
                 <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Data Lançamento</label>
@@ -868,7 +952,7 @@ export default function App(){
               </div>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
                 <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Quantidade (KG)</label>
-                  <input style={inp} type="number" min="0" step="any" placeholder="0" value={newMov.qty} required onChange={e=>setNewMov(m=>({...m,qty:e.target.value}))}/>
+                  <input style={inp} type="number" min="0.001" step="any" value={newMov.qty} required onChange={e=>setNewMov(m=>({...m,qty:e.target.value}))}/>
                 </div>
                 <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Depósito</label>
                   <select style={inp} value={newMov.dep} onChange={e=>setNewMov(m=>({...m,dep:e.target.value}))}>
@@ -876,48 +960,54 @@ export default function App(){
                   </select>
                 </div>
               </div>
-              <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Doc. Material / NF / Observação</label>
-                <input style={inp} type="text" placeholder="Número do documento SAP ou NF..." value={newMov.obs} onChange={e=>setNewMov(m=>({...m,obs:e.target.value}))}/>
+              <div><label style={{fontSize:12,fontWeight:600,color:C.gray600,display:"block",marginBottom:3}}>Doc. SAP / NF / Obs.</label>
+                <input style={inp} type="text" value={newMov.obs} onChange={e=>setNewMov(m=>({...m,obs:e.target.value}))} placeholder="Número do documento, NF..."/>
               </div>
-              <div style={{background:newMov.tipo==="101"||newMov.tipo==="202"?C.greenLight:C.redAlertLight,borderRadius:8,padding:"8px 12px",fontSize:12,color:newMov.tipo==="101"||newMov.tipo==="202"?C.green:C.redAlert}}>
-                {newMov.tipo==="201"?"↓ Saída de consumo para centro de custo — reduz estoque":newMov.tipo==="261"?"↓ Saída para ordem de produção — reduz estoque":newMov.tipo==="101"?"↑ Entrada por compra (NF entrada) — aumenta estoque":"↑ Devolução — aumenta estoque"}
+              <div style={{background:["101","202"].includes(newMov.tmov)?C.greenLight:C.redAlertLight,borderRadius:8,padding:"8px 12px",fontSize:11,
+                color:["101","202"].includes(newMov.tmov)?C.green:C.redAlert}}>
+                {newMov.tmov==="201"?"↓ Saída consumo — centro de custo — reduz estoque":
+                 newMov.tmov==="261"?"↓ Saída para ordem de produção — reduz estoque":
+                 newMov.tmov==="101"?"↑ Entrada por compra (nota fiscal) — aumenta estoque":"↑ Devolução — aumenta estoque"}
               </div>
             </div>
-            <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+            <div style={{display:"flex",gap:8,marginTop:14,justifyContent:"flex-end"}}>
               <button type="button" style={btnS} onClick={()=>setShowAddMov(false)}>Cancelar</button>
               <button type="submit" style={btnP}>Salvar</button>
             </div>
           </form>
         </Modal>}
         <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden"}}>
-          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}>
+          <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr style={{background:C.gray50}}>
-              {["Data Lçto.","Produto","Cód. SAP","Tipo Mov.","Quantidade","Dep.","Doc. Material","Observação"].map(h=><th key={h} style={TH}>{h}</th>)}
+              {["Data","Produto","Cód. SAP","Tipo Mov.","Quantidade","Dep.","Doc. Material","Obs."].map(h=><th key={h} style={TH}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {filteredMovs.slice(0,150).map((m,i)=>{
+              {filtMovs.slice(0,200).map((m,i)=>{
                 const prod=products.find(p=>p.id===m.pid);
-                const isSaida=Number(m.qty)<0||m.tipo==="201"||m.tipo==="261";
-                return<tr key={m.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-                  <td style={{padding:"8px 14px",fontSize:12,whiteSpace:"nowrap"}}>{fmtDate(m.date)}</td>
-                  <td style={{padding:"8px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{prod?.name||"—"}</td>
-                  <td style={{padding:"8px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{prod?.codeSAP||"—"}</td>
-                  <td style={{padding:"8px 14px"}}>
-                    <span style={{background:isSaida?C.redAlertLight:C.greenLight,color:isSaida?C.redAlert:C.green,padding:"2px 7px",borderRadius:20,fontSize:10,fontWeight:700}}>
-                      {m.tipo||"—"} {isSaida?"↓ SAÍDA":"↑ ENTRADA"}
+                const isSaida=m.qty<0||["201","261"].includes(m.tmov);
+                return <tr key={m.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
+                  <td style={{padding:"7px 14px",fontSize:11,whiteSpace:"nowrap"}}>{D(m.date)}</td>
+                  <td style={{padding:"7px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{prod?.name||"—"}</td>
+                  <td style={{padding:"7px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{prod?.codeSAP||"—"}</td>
+                  <td style={{padding:"7px 14px"}}>
+                    <span style={{background:isSaida?C.redAlertLight:C.greenLight,color:isSaida?C.redAlert:C.green,
+                      padding:"1px 7px",borderRadius:20,fontSize:10,fontWeight:700}}>
+                      {m.tmov} {isSaida?"↓":"↑"}
                     </span>
                   </td>
-                  <td style={{padding:"8px 14px",fontSize:12,fontWeight:700,color:isSaida?C.redAlert:C.green}}>
-                    {isSaida?"-":"+"} {fmtN(Math.abs(Number(m.qty)))} KG
+                  <td style={{padding:"7px 14px",fontWeight:700,fontSize:11,color:isSaida?C.redAlert:C.green,textAlign:"right"}}>
+                    {isSaida?"-":"+"}{N(Math.abs(m.qty))} KG
                   </td>
-                  <td style={{padding:"8px 14px",fontSize:11,color:C.gray400}}>{m.dep}</td>
-                  <td style={{padding:"8px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{m.doc}</td>
-                  <td style={{padding:"8px 14px",fontSize:11,color:C.gray400}}>{m.obs||"—"}</td>
+                  <td style={{padding:"7px 14px",fontSize:11,color:C.gray400}}>{m.dep}</td>
+                  <td style={{padding:"7px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{m.doc}</td>
+                  <td style={{padding:"7px 14px",fontSize:11,color:C.gray400}}>{m.obs||"—"}</td>
                 </tr>;
               })}
             </tbody>
-          </table></div>
-          {filteredMovs.length>150&&<div style={{padding:8,textAlign:"center",fontSize:11,color:C.gray400}}>Mostrando 150 de {filteredMovs.length}</div>}
+          </table>
+          </div>
+          {filtMovs.length>200&&<div style={{padding:"7px 14px",textAlign:"center",fontSize:11,color:C.gray400,background:C.gray50}}>Mostrando 200 de {filtMovs.length} · Use o filtro para refinar</div>}
         </div>
       </div>}
 
@@ -926,27 +1016,28 @@ export default function App(){
 
       {/* ══ ALERTAS ══ */}
       {tab==="Alertas"&&<div>
-        <div style={{marginBottom:18}}>
+        <div style={{marginBottom:16}}>
           <div style={{fontSize:20,fontWeight:800}}>Central de Alertas</div>
-          <div style={{fontSize:11,color:C.gray400,marginTop:2}}>{alerts.length} alertas ativos · posição 01/05/2026</div>
+          <div style={{fontSize:11,color:C.gray400,marginTop:2}}>{alerts.length} alertas · Posição 01/05/2026</div>
         </div>
-        {alerts.length===0&&<div style={{background:C.greenLight,borderRadius:12,padding:32,textAlign:"center",color:C.green,fontWeight:700,fontSize:14}}>✓ Nenhum alerta. Todos os estoques adequados!</div>}
-        <div style={{display:"flex",flexDirection:"column",gap:9,marginBottom:22}}>
-          {alerts.map((a,i)=><div key={i} style={{background:C.white,borderRadius:12,padding:"12px 16px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",borderLeft:`4px solid ${a.sev==="critical"?C.red:C.yellow}`,display:"flex",alignItems:"center",gap:12}}>
-            <div style={{color:a.sev==="critical"?C.red:C.yellow,fontSize:18}}>{a.sev==="critical"?"✕":"⚠"}</div>
+        {alerts.length===0&&<div style={{background:C.greenLight,borderRadius:12,padding:32,textAlign:"center",color:C.green,fontWeight:700,fontSize:14}}>✓ Nenhum alerta. Todos os estoques estão adequados!</div>}
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
+          {alerts.map((a,i)=><div key={i} style={{background:C.white,borderRadius:11,padding:"11px 14px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",
+            borderLeft:`4px solid ${a.sev==="critical"?C.red:C.yellow}`,display:"flex",alignItems:"center",gap:12}}>
+            <div style={{color:a.sev==="critical"?C.red:C.yellow,fontSize:17}}>{a.sev==="critical"?"✕":"⚠"}</div>
             <div style={{flex:1}}>
               <div style={{fontWeight:700,fontSize:13}}>{a.product}</div>
-              <div style={{fontSize:12,color:C.gray600,marginTop:1}}>{a.msg} · <span style={{fontFamily:"monospace",fontSize:10}}>{a.cod}</span></div>
+              <div style={{fontSize:11,color:C.gray600,marginTop:1}}>{a.msg} · <span style={{fontFamily:"monospace",fontSize:10}}>{a.cod}</span></div>
             </div>
-            <span style={{background:a.sev==="critical"?C.redAlertLight:C.yellowLight,color:a.sev==="critical"?C.red:C.yellow,padding:"2px 9px",borderRadius:20,fontSize:10,fontWeight:700}}>
+            <span style={{background:a.sev==="critical"?C.redAlertLight:C.yellowLight,color:a.sev==="critical"?C.red:C.yellow,padding:"2px 8px",borderRadius:20,fontSize:10,fontWeight:700}}>
               {a.sev==="critical"?"CRÍTICO":"ATENÇÃO"}
             </span>
           </div>)}
         </div>
         <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden"}}>
-          <div style={{padding:"12px 18px",borderBottom:`1px solid ${C.gray100}`}}><div style={{fontWeight:700,fontSize:14}}>Log de Auditoria</div></div>
-          {logs.map((l,i)=><div key={l.id} style={{padding:"9px 18px",borderBottom:`1px solid ${C.gray100}`,display:"flex",gap:10,alignItems:"center",background:i%2===0?C.white:C.gray50}}>
-            <div style={{width:27,height:27,background:C.redLight,borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",color:C.red,fontSize:11,fontWeight:700,flexShrink:0}}>{l.user[0].toUpperCase()}</div>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${C.gray100}`}}><div style={{fontWeight:700,fontSize:14}}>Log de Auditoria</div></div>
+          {logs.map((l,i)=><div key={l.id} style={{padding:"8px 16px",borderBottom:`1px solid ${C.gray100}`,display:"flex",gap:10,alignItems:"center",background:i%2===0?C.white:C.gray50}}>
+            <div style={{width:26,height:26,background:C.redLight,borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",color:C.red,fontSize:11,fontWeight:700,flexShrink:0}}>{l.user[0].toUpperCase()}</div>
             <div style={{flex:1}}>
               <div style={{fontSize:12,fontWeight:600}}>{l.action}</div>
               <div style={{fontSize:10,color:C.gray400,marginTop:1}}>por <b>{l.user}</b></div>
@@ -958,83 +1049,89 @@ export default function App(){
 
       {/* ══ RELATÓRIOS ══ */}
       {tab==="Relatórios"&&<div>
-        <div style={{marginBottom:18}}>
+        <div style={{marginBottom:16}}>
           <div style={{fontSize:20,fontWeight:800}}>Relatórios e Análises</div>
-          <div style={{fontSize:11,color:C.gray400,marginTop:2}}>Jan–Mai 2026 · {PERIODO_DIAS} dias · Centro C201 · Refinaria de Manaus S.A.</div>
+          <div style={{fontSize:11,color:C.gray400}}>Jan–Mai 2026 · {PERIODO_DIAS} dias · Centro C201 · Refinaria de Manaus S.A.</div>
         </div>
 
-        {/* Resumo balanço por produto */}
-        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden",marginBottom:14}}>
-          <div style={{padding:"12px 18px",borderBottom:`1px solid ${C.gray100}`}}>
-            <div style={{fontWeight:700,fontSize:14}}>Balanço de Estoque por Produto — {PERIODO_DIAS} dias</div>
-            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Fórmula: Consumo = (Est.Inicial + Entradas) - Est.Final · Verificado contra MB5B SAP</div>
+        {/* Balanço */}
+        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden",marginBottom:12}}>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${C.gray100}`}}>
+            <div style={{fontWeight:700,fontSize:14}}>Balanço de Estoque — MB5B SAP</div>
+            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Consumo = (EstInicial + Entradas) − EstFinal = TotalSaídas ÷ {PERIODO_DIAS} dias</div>
           </div>
-          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}>
+          <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr style={{background:C.gray50}}>
-              {["Produto","Est. Inicial","+ Entradas","- Saídas (Cons.)","= Saldo SAP","Cons./dia","Cons./mês","Cobertura"].map(h=><th key={h} style={TH}>{h}</th>)}
+              {["Produto","Cód. SAP","Est. Inicial","+ Entradas","− Saídas","= Saldo SAP","Cons./dia","Cons./mês","Cobertura","Compra Sug."].map(h=><th key={h} style={TH}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {[...analytics].sort((a,b)=>b.totalSaidas-a.totalSaidas).map((p,i)=><tr key={p.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
-                <td style={{padding:"9px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{p.name}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right"}}>{fmtN(p.estIni||0)}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right",color:C.green,fontWeight:600}}>+{fmtN(p.totalEntradas)}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right",color:C.redAlert,fontWeight:600}}>-{fmtN(p.totalSaidas)}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right",fontWeight:700}}>{fmtN(p.estAtual)}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right",fontWeight:600}}>{fmtN(p.consDia,2)}</td>
-                <td style={{padding:"9px 14px",fontSize:11,textAlign:"right"}}>{fmtN(p.consMes,0)}</td>
-                <td style={{padding:"9px 14px"}}><StatusBadge days={p.cobertura}/></td>
+              {[...analytics].sort((a,b)=>a.cobertura-b.cobertura).map((p,i)=><tr key={p.id} style={{borderBottom:`1px solid ${C.gray100}`,background:i%2===0?C.white:C.gray50}}>
+                <td style={{padding:"8px 14px",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{p.name}</td>
+                <td style={{padding:"8px 14px",fontSize:10,fontFamily:"monospace",color:C.gray400}}>{p.codeSAP}</td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",color:C.gray600}}>0</td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",color:C.green,fontWeight:600}}>+{N(p.totEnt,0)}</td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",color:C.redAlert,fontWeight:600}}>−{N(p.totSai,0)}</td>
+                <td style={{padding:"8px 14px",fontSize:12,textAlign:"right",fontWeight:800}}>{N(p.estAtual,0)}</td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",fontWeight:700,color:C.red}}>{N(p.consDia,2)}</td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",color:C.gray600}}>{N(p.consMes,0)}</td>
+                <td style={{padding:"8px 14px"}}><Badge days={p.cobertura}/></td>
+                <td style={{padding:"8px 14px",fontSize:11,textAlign:"right",fontWeight:700,color:p.compra>0?C.red:C.gray300}}>
+                  {p.compra>0?`${N(p.compra,0)} KG`:"—"}
+                </td>
               </tr>)}
             </tbody>
-          </table></div>
+          </table>
+          </div>
         </div>
 
-        {/* Consumo gráfico de barras */}
-        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",padding:18,marginBottom:14}}>
-          <div style={{fontWeight:700,fontSize:14,marginBottom:14}}>Ranking de Consumo — Total Jan–Mai 2026</div>
-          {[...analytics].sort((a,b)=>b.totalSaidas-a.totalSaidas).map(p=><div key={p.id} style={{marginBottom:11}}>
+        {/* Ranking consumo */}
+        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",padding:18,marginBottom:12}}>
+          <div style={{fontWeight:700,fontSize:14,marginBottom:12}}>Ranking de Consumo — Jan a Mai 2026 (Total MB5B)</div>
+          {[...analytics].sort((a,b)=>b.totSai-a.totSai).map(p=><div key={p.id} style={{marginBottom:10}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
-              <span style={{fontSize:11,fontWeight:600,flex:1}}>{p.name}</span>
-              <div style={{display:"flex",gap:14,alignItems:"center",flexShrink:0}}>
-                <span style={{fontSize:10,color:C.gray400}}>Entradas: {fmtN(p.totalEntradas)} KG</span>
-                <span style={{fontSize:11,fontWeight:700,color:C.red}}>Saídas: {fmtN(p.totalSaidas)} KG</span>
-                <span style={{fontSize:10,color:C.gray400,width:70,textAlign:"right"}}>{fmtN(p.consDia,1)} KG/d</span>
+              <span style={{fontSize:11,fontWeight:600,flex:1,whiteSpace:"nowrap",marginRight:10}}>{p.name}</span>
+              <div style={{display:"flex",gap:12,alignItems:"center",flexShrink:0}}>
+                <span style={{fontSize:10,color:C.gray400}}>Ent: {N(p.totEnt,0)}</span>
+                <span style={{fontSize:11,fontWeight:700,color:C.red}}>Saí: {N(p.totSai,0)} KG</span>
+                <span style={{fontSize:10,color:C.gray500,width:80,textAlign:"right"}}>{N(p.consDia,2)} KG/d</span>
               </div>
             </div>
-            <Bar value={p.totalSaidas} max={maxSaidas} color={C.red} h={8}/>
+            <Bar v={p.totSai} max={maxSai} color={C.red} h={7}/>
           </div>)}
         </div>
 
         {/* Plano de compras */}
-        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden",marginBottom:14}}>
-          <div style={{padding:"12px 18px",borderBottom:`1px solid ${C.gray100}`}}>
-            <div style={{fontWeight:700,fontSize:14}}>Plano de Compras — Cobertura Meta: 60 dias</div>
-            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Compra = (Cons/dia × (60 + Lead Time)) − Saldo Atual</div>
+        <div style={{background:C.white,borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden",marginBottom:12}}>
+          <div style={{padding:"11px 16px",borderBottom:`1px solid ${C.gray100}`}}>
+            <div style={{fontWeight:700,fontSize:14}}>Plano de Compras — Meta: 60 dias de cobertura</div>
+            <div style={{fontSize:10,color:C.gray400,marginTop:1}}>Compra Sugerida = Cons/dia × (60 + Lead Time) − Saldo Atual</div>
           </div>
-          {analytics.filter(p=>p.compraSugerida>0).length===0&&<div style={{padding:18,color:C.gray400,textAlign:"center",fontSize:12}}>✓ Todos os produtos com cobertura ≥ 60 dias</div>}
-          {[...analytics].filter(p=>p.compraSugerida>0).sort((a,b)=>a.cobertura-b.cobertura).map(p=><div key={p.id} style={{padding:"11px 18px",borderBottom:`1px solid ${C.gray100}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          {[...analytics].filter(p=>p.compra>0).sort((a,b)=>a.cobertura-b.cobertura).map(p=><div key={p.id} style={{padding:"10px 16px",borderBottom:`1px solid ${C.gray100}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div style={{flex:1}}>
               <div style={{fontWeight:600,fontSize:13}}>{p.name}</div>
               <div style={{fontSize:10,color:C.gray400,marginTop:2}}>
-                Lead time: {p.leadTime}d · Saldo: {fmtN(p.estAtual)} KG · Cons./dia: {fmtN(p.consDia,2)} KG · Cob. atual: {p.cobertura===9999?"∞":p.cobertura+"d"}
+                SAP: {p.codeSAP} · LT: {p.leadTime}d · Saldo: {N(p.estAtual,0)} KG · Cons/dia: {N(p.consDia,2)} KG · Cob: {p.cobertura===9999?"∞":p.cobertura+"d"}
               </div>
             </div>
             <div style={{textAlign:"right",flexShrink:0,marginLeft:16}}>
-              <div style={{fontWeight:800,fontSize:15,color:C.red}}>{fmtN(p.compraSugerida,0)} KG</div>
-              <StatusBadge days={p.cobertura}/>
+              <div style={{fontWeight:800,fontSize:15,color:C.red}}>{N(p.compra,0)} KG</div>
+              <Badge days={p.cobertura}/>
             </div>
           </div>)}
+          {analytics.filter(p=>p.compra>0).length===0&&<div style={{padding:18,textAlign:"center",color:C.gray400,fontSize:12}}>✓ Todos com cobertura ≥ 60 dias</div>}
         </div>
 
         <div style={{display:"flex",gap:8}}>
-          <button style={{...btnP,fontSize:12}} onClick={()=>alert("Exporte com SheetJS — biblioteca já disponível na aba Importar SAP")}>⬇ Exportar Excel</button>
-          <button style={{...btnS,fontSize:12}} onClick={()=>alert("Integre pdfmake para exportação em PDF")}>⬇ Exportar PDF</button>
+          <button style={{...btnP,fontSize:12}} onClick={()=>alert("Para exportar: integre SheetJS (já disponível na aba Importar SAP)")}>⬇ Exportar Excel</button>
+          <button style={{...btnS,fontSize:12}} onClick={()=>alert("Para PDF: adicione pdfmake via npm ao projeto")}>⬇ Exportar PDF</button>
         </div>
       </div>}
 
     </main>
 
-    <footer style={{borderTop:`1px solid ${C.gray200}`,padding:"11px 22px",display:"flex",justifyContent:"space-between",alignItems:"center",background:C.white,marginTop:22}}>
-      <div style={{fontSize:10,color:C.gray400}}>CHEMTRACK · Refinaria de Manaus S.A. · Centro C201 · Fórmula: Consumo = Saídas SAP (201+261) ÷ {PERIODO_DIAS} dias</div>
+    <footer style={{borderTop:`1px solid ${C.gray200}`,padding:"10px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",background:C.white,marginTop:20}}>
+      <div style={{fontSize:10,color:C.gray400}}>CHEMTRACK · Refinaria de Manaus S.A. · Centro C201 · Cons/dia = Saídas SAP ÷ {PERIODO_DIAS}d</div>
       <div style={{display:"flex",gap:10,alignItems:"center"}}>
         <div style={{fontSize:10,color:C.gray400}}>{products.length} produtos · {movements.length} movimentos</div>
         <div style={{width:5,height:5,borderRadius:"50%",background:C.green}}/>
